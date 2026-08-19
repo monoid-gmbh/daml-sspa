@@ -1,0 +1,20 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | SSPA 2100 -- Warrant.
+--
+-- A plain vanilla, cash-settled, automatically-exercised call or put option: small investment,
+-- leveraged performance relative to the underlying, risk of total loss limited to the initial
+-- investment. This maps directly onto daml-finance's own
+-- `Daml.Finance.Instrument.Option.V0.EuropeanCash` package, so we reuse it as-is here rather than
+-- reimplementing an equivalent instrument from scratch.
+--
+-- See `Sspa.Leverage.SpreadWarrant` (SSPA 2110) for an example of composing two of these builders
+-- from scratch into a capped structure that daml-finance doesn't ship a ready-made instrument for.
+module Sspa.Leverage.Warrant
+  ( Instrument(..)
+  , Factory(..)
+  ) where
+
+import Daml.Finance.Instrument.Option.V0.EuropeanCash.Factory (Factory(..))
+import Daml.Finance.Instrument.Option.V0.EuropeanCash.Instrument (Instrument(..))

@@ -1,0 +1,585 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | End-to-end Daml Script scenarios for the six SSPA Yield Enhancement products. Each scenario
+-- originates a note, mints it into the investor's holding, lifecycles the underlying claim tree
+-- forward through one or more market events (feeding it price fixings via an `Observation`
+-- contract), and then claims + fully settles every `Effect` produced -- asserting the investor's
+-- actual CHF holding balance at each step. Expected amounts are computed by hand in the comments so
+-- that each assertion is self-documenting.
+--
+-- All coupon-bearing products in this suite (`ReverseConvertible`, `BarrierReverseConvertible`,
+-- `ConditionalCouponReverseConvertible`, `ConditionalCouponBarrierReverseConvertible`) use a
+-- single-period quarterly schedule from `issueDate` to `maturityDate` (Jan 1 2026 -> Apr 1 2026,
+-- 90 days), so that the coupon, the barrier/call/put observation, and the redemption all resolve
+-- together in a single `lifecycleInstrument` call at `maturityDate`. With `Act360`, this period's
+-- day count fraction is exactly `90 / 360 = 0.25`, so a `couponRate` of `0.08` (8% p.a.) always
+-- yields a coupon of `notional * 0.08 * 0.25 = notional * 0.02`.
+module Sspa.Test.YieldEnhancement where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Map qualified as Map
+import DA.Set qualified as Set
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Instrument.StructuredProduct.V0.AutoCallable.Factory qualified as
+  AutoCallableImpl (Factory(..))
+import Daml.Finance.Instrument.StructuredProduct.V0.BarrierReverseConvertible.Factory qualified as
+  BarrierReverseConvertibleImpl (Factory(..))
+import Daml.Finance.Interface.Instrument.StructuredProduct.V0.AutoCallable.Factory qualified as
+  AutoCallableFactory (Create(..), I)
+import Daml.Finance.Interface.Instrument.StructuredProduct.V0.AutoCallable.Types (AutoCallable(..))
+import Daml.Finance.Interface.Instrument.StructuredProduct.V0.BarrierReverseConvertible.Factory
+  qualified as BarrierReverseConvertibleFactory (Create(..), I)
+import Daml.Finance.Interface.Instrument.StructuredProduct.V0.BarrierReverseConvertible.Types
+  (BarrierReverseConvertible(..))
+import Daml.Finance.Interface.Types.Common.V3.Types
+  (HoldingStandard(..), Id(..), InstrumentKey(..), PartiesMap)
+import Daml.Finance.Interface.Types.Date.V3.Calendar (BusinessDayConventionEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.DayCount (DayCountConventionEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.RollConvention (PeriodEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.Schedule (PeriodicSchedule)
+import Daml.Script
+import Sspa.Test.Setup
+import Sspa.YieldEnhancement.BarrierDiscountCertificate qualified as BarrierDiscountCertificate
+import Sspa.YieldEnhancement.DiscountCertificate qualified as DiscountCertificate
+import Sspa.YieldEnhancement.ReverseConvertible qualified as ReverseConvertible
+
+-- | Originate a `BarrierReverseConvertible` (SSPA 1230) instrument via daml-finance's own
+-- `Daml.Finance.Instrument.StructuredProduct.V0.BarrierReverseConvertible` factory. Kept as a local
+-- helper (rather than a `Sspa.Test.Setup` addition) since this test module must not depend on
+-- changes to shared scaffolding used by sibling test suites.
+originateBarrierReverseConvertible : Party -> Text -> HoldingStandard -> Text -> PartiesMap -> Time ->
+  Date -> Decimal -> Decimal -> Date -> InstrumentKey -> Text -> Decimal -> PeriodicSchedule ->
+  [Text] -> DayCountConventionEnum -> Decimal -> Party -> Script InstrumentKey
+originateBarrierReverseConvertible issuer label holdingStandard description observers
+  lastEventTimestamp expiryDate strike barrier barrierStartDate currency referenceAssetId
+  couponRate periodicSchedule holidayCalendarIds dayCountConvention notional calendarDataProvider = do
+    brcFactoryCid <- toInterfaceContractId @BarrierReverseConvertibleFactory.I <$> submit issuer do
+      createCmd BarrierReverseConvertibleImpl.Factory with provider = issuer; observers = mempty
+    let
+      instrument = InstrumentKey with
+        issuer; depository = issuer; id = Id label; version = "0"; holdingStandard
+    submitMulti [issuer] [] do
+      exerciseCmd brcFactoryCid BarrierReverseConvertibleFactory.Create with
+        barrierReverseConvertible = BarrierReverseConvertible with
+          instrument; description; expiryDate; strike; barrier; barrierStartDate
+          referenceAssetId; couponRate; periodicSchedule; holidayCalendarIds; calendarDataProvider
+          dayCountConvention; notional; currency; lastEventTimestamp; prevEvents = []
+        observers
+    pure instrument
+
+-- | Originate an `AutoCallable` (SSPA 1255 / 1260, depending on parameterization) instrument via
+-- daml-finance's own `Daml.Finance.Instrument.StructuredProduct.V0.AutoCallable` factory. Kept as a
+-- local helper for the same reason as `originateBarrierReverseConvertible` above.
+--
+-- Note: the underlying `AutoCallable.Instrument.getClaims` implementation currently only supports
+-- `putStrike == 1.00` (100% of the initial fixing) -- it asserts this explicitly -- so `putStrike`
+-- must always be `1.0` here.
+originateAutoCallable : Party -> Text -> HoldingStandard -> Text -> PartiesMap -> Time -> Decimal ->
+  Decimal -> Decimal -> Decimal -> InstrumentKey -> Text -> Decimal -> PeriodicSchedule ->
+  PeriodicSchedule -> [Text] -> DayCountConventionEnum -> Decimal -> Party -> Script InstrumentKey
+originateAutoCallable issuer label holdingStandard description observers lastEventTimestamp
+  putStrike couponBarrier callBarrier finalBarrier currency referenceAssetId couponRate
+  observationSchedule periodicSchedule holidayCalendarIds dayCountConvention notional
+  calendarDataProvider = do
+    factoryCid <- toInterfaceContractId @AutoCallableFactory.I <$> submit issuer do
+      createCmd AutoCallableImpl.Factory with provider = issuer; observers = mempty
+    let
+      instrument = InstrumentKey with
+        issuer; depository = issuer; id = Id label; version = "0"; holdingStandard
+    submitMulti [issuer] [] do
+      exerciseCmd factoryCid AutoCallableFactory.Create with
+        autoCallable = AutoCallable with
+          instrument; description; putStrike; couponBarrier; callBarrier; finalBarrier
+          referenceAssetId; couponRate; observationSchedule; periodicSchedule; holidayCalendarIds
+          calendarDataProvider; dayCountConvention; notional; currency; lastEventTimestamp
+          prevEvents = []
+        observers
+    pure instrument
+
+-- | SSPA 1200 -- Discount Certificate.
+--
+-- Modeled as a long zero-coupon note redeeming the full nominal at maturity, minus a short vanilla
+-- put struck at `strike`: at maturity the holder receives `notional * min(spot, strike) / strike`.
+--
+-- Scenario A: the underlying finishes above the strike -> capped at the full nominal.
+-- Scenario B: the underlying finishes below the strike -> redemption tracks the underlying.
+runDiscountCertificate : Script ()
+runDiscountCertificate = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    referenceAssetId = "SSPA1200-UNDERLYING"
+    strike = 100.0
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: spot@maturity = 120.0 (above strike) -> capped at the full nominal.
+  --   redemption = notional * min(120, 100) / 100 = 1000 * 1.00 = 1000.0
+  do
+    factoryCid <- submit issuer do
+      createCmd DiscountCertificate.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid DiscountCertificate.Originate with
+        id = Id "SSPA1200-ITM"; description = "Discount Certificate (above strike)"
+        referenceAssetId; strike; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 120.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1200-itm")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1000.0
+
+  -- Scenario B: spot@maturity = 80.0 (below strike) -> redemption tracks the underlying.
+  --   redemption = notional * min(80, 100) / 100 = 1000 * 0.80 = 800.0
+  do
+    factoryCid <- submit issuer do
+      createCmd DiscountCertificate.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid DiscountCertificate.Originate with
+        id = Id "SSPA1200-OTM"; description = "Discount Certificate (below strike)"
+        referenceAssetId; strike; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 80.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1200-otm")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 800.0
+
+  pure ()
+
+-- | SSPA 1210 -- Barrier Discount Certificate.
+--
+-- Like `Sspa.YieldEnhancement.DiscountCertificate` (SSPA 1200), but the short put only knocks in if
+-- the underlying touches or breaches the (lower) `barrier` at some point. As long as the barrier is
+-- never touched, the holder always receives the full nominal, regardless of the terminal spot.
+--
+-- Scenario A: the barrier is never touched -> full nominal, even though the underlying finishes
+-- below the strike.
+-- Scenario B: the barrier is touched at an interim date -> behaves like a plain Discount
+-- Certificate (1200) from that point on.
+runBarrierDiscountCertificate : Script ()
+runBarrierDiscountCertificate = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA1210-UNDERLYING"
+    strike = 100.0
+    barrier = 70.0
+    barrierStartDate = issueDate
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: barrier never touched -> full nominal regardless of the terminal spot.
+  --   spot@maturity = 80.0 (below strike, but the barrier at 70.0 was never touched)
+  --   expected redemption = notional = 1000.0
+  do
+    factoryCid <- submit issuer do
+      createCmd BarrierDiscountCertificate.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid BarrierDiscountCertificate.Originate with
+        id = Id "SSPA1210-NOBREACH"; description = "Barrier Discount Certificate (no breach)"
+        referenceAssetId; strike; barrier; barrierStartDate; maturityDate
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    -- An observation at `barrierStartDate` is required too: it coincides here with the
+    -- instrument's inception, which the lifecycle engine processes as a synthetic time-event
+    -- checkpoint while fast-forwarding, and evaluating the claim tree's `at barrierStartDate`
+    -- node at that checkpoint needs to resolve the barrier condition's `Observe`.
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (maturityDate, 80.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1210-nobreach")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1000.0
+
+  -- Scenario B: barrier touched at breachDate (65.0 <= 70.0) -> behaves like a plain Discount
+  -- Certificate from then on.
+  --   spot@maturity = 80.0 -> redemption = notional * min(80, 100) / 100 = 800.0
+  do
+    factoryCid <- submit issuer do
+      createCmd BarrierDiscountCertificate.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid BarrierDiscountCertificate.Originate with
+        id = Id "SSPA1210-BREACH"; description = "Barrier Discount Certificate (breach)"
+        referenceAssetId; strike; barrier; barrierStartDate; maturityDate
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (breachDate, 65.0), (maturityDate, 80.0)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0 [obsCid]
+    breachResult <-
+      claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1210-breach-touch")
+    -- No cash should be produced purely by the barrier touch itself.
+    breachResult.cashHoldingCid === None
+    Some noteHoldingCid1 <- pure breachResult.noteHoldingCid
+
+    (_, [maturityEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1 [obsCid]
+    maturityResult <-
+      claimAndSettle infra noteHoldingCid1 maturityEffectCid (Id "settle-1210-breach-maturity")
+    Some maturityCashCid <- pure maturityResult.cashHoldingCid
+    maturityTotal <- sumHoldingAmounts investor [maturityCashCid]
+    maturityTotal === 800.0
+
+  pure ()
+
+-- | SSPA 1220 -- Reverse Convertible.
+--
+-- Modeled as a long fixed-coupon bond (redeeming the full nominal at maturity) plus a short vanilla
+-- put struck at `strike`: a fixed coupon is paid unconditionally each period, plus
+-- `notional * min(spot, strike) / strike` at maturity.
+--
+-- Scenario A: the underlying finishes above the strike -> coupon + full nominal.
+-- Scenario B: the underlying finishes below the strike -> coupon (still paid) + tracked redemption.
+runReverseConvertible : Script ()
+runReverseConvertible = script do
+  infra@Infra{issuer; investor; calendarDataProvider; publicParty; cashInstrument; holdingFactoryCid;
+    investorNoteAccount} <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    referenceAssetId = "SSPA1220-UNDERLYING"
+    strike = 100.0
+    couponRate = 0.08
+    notional = 1000.0
+    holidayCalendarIds = ["CHF"]
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+    -- A single coupon period spanning the note's whole life: [issueDate, maturityDate].
+    periodicSchedule = createPaymentPeriodicSchedule maturityDate holidayCalendarIds NoAdjustment M 3
+      issueDate maturityDate
+
+  createHolidayCalendar calendarDataProvider "CHF" [issuer, investor, publicParty]
+
+  -- Scenario A: spot@maturity = 120.0 (above strike) -> full nominal + coupon.
+  --   coupon (Act360, dcf = 90 / 360 = 0.25) = notional * couponRate * dcf = 1000 * 0.08 * 0.25
+  --                                          = 20.0
+  --   redemption = notional * min(120, 100) / 100                         = 1000.0
+  --   expected total CHF credited to investor                            = 1020.0
+  do
+    factoryCid <- submit issuer do
+      createCmd ReverseConvertible.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid ReverseConvertible.Originate with
+        id = Id "SSPA1220-ITM"; description = "Reverse Convertible (above strike)"
+        referenceAssetId; strike; couponRate; periodicSchedule; holidayCalendarIds
+        calendarDataProvider; dayCountConvention = Act360; currency = cashInstrument; notional
+        observers; holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 120.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1220-itm")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1020.0
+
+  -- Scenario B: spot@maturity = 80.0 (below strike) -> coupon still paid, redemption tracks spot.
+  --   coupon     = 20.0 (unconditional)
+  --   redemption = notional * min(80, 100) / 100 = 800.0
+  --   expected total CHF credited to investor    = 820.0
+  do
+    factoryCid <- submit issuer do
+      createCmd ReverseConvertible.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid ReverseConvertible.Originate with
+        id = Id "SSPA1220-OTM"; description = "Reverse Convertible (below strike)"
+        referenceAssetId; strike; couponRate; periodicSchedule; holidayCalendarIds
+        calendarDataProvider; dayCountConvention = Act360; currency = cashInstrument; notional
+        observers; holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 80.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1220-otm")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 820.0
+
+  pure ()
+
+-- | SSPA 1230 -- Barrier Reverse Convertible.
+--
+-- Re-exports daml-finance's own `BarrierReverseConvertible`: exactly like
+-- `Sspa.YieldEnhancement.ReverseConvertible` (SSPA 1220), but the short put only knocks in once the
+-- underlying touches or breaches the (lower) `barrier`.
+--
+-- Scenario A: the barrier is never touched -> coupon + full nominal, even though the underlying
+-- finishes below the strike.
+-- Scenario B: the barrier is touched at an interim date -> behaves like a plain Reverse
+-- Convertible from that point on.
+runBarrierReverseConvertible : Script ()
+runBarrierReverseConvertible = script do
+  infra@Infra{issuer; investor; calendarDataProvider; publicParty; cashInstrument; holdingFactoryCid;
+    investorNoteAccount} <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA1230-UNDERLYING"
+    strike = 100.0
+    barrier = 70.0
+    barrierStartDate = issueDate
+    couponRate = 0.08
+    notional = 1000.0
+    holidayCalendarIds = ["CHF"]
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+    periodicSchedule = createPaymentPeriodicSchedule maturityDate holidayCalendarIds NoAdjustment M 3
+      issueDate maturityDate
+
+  createHolidayCalendar calendarDataProvider "CHF" [issuer, investor, publicParty]
+
+  -- Scenario A: barrier never touched -> coupon (unconditional) + full nominal.
+  --   coupon     = notional * couponRate * dcf(0.25) = 1000 * 0.08 * 0.25 = 20.0
+  --   redemption = notional (put inactive)                                = 1000.0
+  --   expected total CHF credited to investor                            = 1020.0
+  do
+    noteInstrument <- originateBarrierReverseConvertible issuer "SSPA1230-NOBREACH"
+      TransferableFungible "Barrier Reverse Convertible (no breach)" observers lastEventTimestamp
+      maturityDate strike barrier barrierStartDate cashInstrument referenceAssetId couponRate
+      periodicSchedule holidayCalendarIds Act360 notional calendarDataProvider
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (maturityDate, 80.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1230-nobreach")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1020.0
+
+  -- Scenario B: barrier touched at breachDate (65.0 <= 70.0) -> put activates.
+  --   coupon     = 20.0 (unconditional)
+  --   redemption = notional * min(80, 100) / 100 = 800.0
+  --   expected total CHF credited to investor    = 820.0
+  do
+    noteInstrument0 <- originateBarrierReverseConvertible issuer "SSPA1230-BREACH"
+      TransferableFungible "Barrier Reverse Convertible (breach)" observers lastEventTimestamp
+      maturityDate strike barrier barrierStartDate cashInstrument referenceAssetId couponRate
+      periodicSchedule holidayCalendarIds Act360 notional calendarDataProvider
+    noteHoldingCid0 <-
+      mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (breachDate, 65.0), (maturityDate, 80.0)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0 [obsCid]
+    breachResult <-
+      claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1230-breach-touch")
+    breachResult.cashHoldingCid === None
+    Some noteHoldingCid1 <- pure breachResult.noteHoldingCid
+
+    (_, [maturityEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1 [obsCid]
+    maturityResult <-
+      claimAndSettle infra noteHoldingCid1 maturityEffectCid (Id "settle-1230-breach-maturity")
+    Some maturityCashCid <- pure maturityResult.cashHoldingCid
+    maturityTotal <- sumHoldingAmounts investor [maturityCashCid]
+    maturityTotal === 820.0
+
+  pure ()
+
+-- | SSPA 1255 -- Conditional Coupon Reverse Convertible.
+--
+-- Re-exports daml-finance's own `AutoCallable`, with `finalBarrier = putStrike` (no additional
+-- protective barrier beyond the strike itself): on the single observation date, a coupon is paid
+-- only if the underlying is quoted above `couponBarrier`; if the underlying is quoted at or above
+-- `callBarrier`, the note is redeemed early at par plus the coupon; otherwise redemption tracks the
+-- underlying's performance below `putStrike` (== 100% of the initial fixing, the only value the
+-- underlying implementation currently supports).
+--
+-- Scenario A: the note autocalls -> par + coupon.
+-- Scenario B: the note does not autocall and finishes below the strike -> tracked redemption
+-- (economically identical to a plain Reverse Convertible, per the 1255/1220 relationship).
+runConditionalCouponReverseConvertible : Script ()
+runConditionalCouponReverseConvertible = script do
+  infra@Infra{issuer; investor; calendarDataProvider; publicParty; cashInstrument; holdingFactoryCid;
+    investorNoteAccount} <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    referenceAssetId = "SSPA1255-UNDERLYING"
+    initialFixing = 100.0
+    notional = 1000.0
+    couponRate = 0.08
+    putStrike = 1.0
+    couponBarrier = 0.6
+    holidayCalendarIds = ["CHF"]
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+    schedule = createPaymentPeriodicSchedule maturityDate holidayCalendarIds NoAdjustment M 3
+      issueDate maturityDate
+
+  createHolidayCalendar calendarDataProvider "CHF" [issuer, investor, publicParty]
+
+  -- Scenario A: autocalled -- spot@call date = 110.0 (>= callBarrier 1.00 * initialFixing = 100.0).
+  --   coupon (spot 110.0 > couponBarrier 0.60 * 100.0 = 60.0, so it is paid)
+  --     = notional * couponRate * dcf(0.25) = 1000 * 0.08 * 0.25 = 20.0
+  --   redemption at call = notional                                                    = 1000.0
+  --   expected total CHF credited to investor                                         = 1020.0
+  do
+    noteInstrument <- originateAutoCallable issuer "SSPA1255-CALLED" TransferableFungible
+      "Conditional Coupon Reverse Convertible (autocalled)" observers lastEventTimestamp putStrike
+      couponBarrier 1.0 putStrike cashInstrument referenceAssetId couponRate schedule schedule
+      holidayCalendarIds Act360 notional calendarDataProvider
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(issueDate, initialFixing), (maturityDate, 110.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1255-called")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1020.0
+
+  -- Scenario B: not autocalled -- spot@call/final date = 80.0 (< callBarrier level 120.0).
+  --   coupon (spot 80.0 > couponBarrier 0.60 * 100.0 = 60.0, so it is paid)             = 20.0
+  --   finalBarrier = putStrike = 1.00 -> level 100.0; spot 80.0 <= 100.0 -> barrier hit
+  --   redemption = notional * spot / (putStrike * initialFixing) = 1000 * 80.0 / 100.0 = 800.0
+  --   expected total CHF credited to investor                                         = 820.0
+  do
+    noteInstrument <- originateAutoCallable issuer "SSPA1255-NOTCALLED" TransferableFungible
+      "Conditional Coupon Reverse Convertible (not called)" observers lastEventTimestamp putStrike
+      couponBarrier 1.2 putStrike cashInstrument referenceAssetId couponRate schedule schedule
+      holidayCalendarIds Act360 notional calendarDataProvider
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(issueDate, initialFixing), (maturityDate, 80.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1255-notcalled")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 820.0
+
+  pure ()
+
+-- | SSPA 1260 -- Conditional Coupon Barrier Reverse Convertible.
+--
+-- Re-exports daml-finance's own `AutoCallable`, with `finalBarrier < putStrike` (an extra
+-- protective barrier below the strike): if the note is not autocalled, full nominal redemption is
+-- still protected as long as the underlying has not touched or breached `finalBarrier` at the final
+-- observation date -- otherwise redemption tracks the underlying's performance below `putStrike`,
+-- same as SSPA 1255.
+--
+-- Scenario A: the note does not autocall and `finalBarrier` is not breached -> full nominal,
+-- despite the underlying finishing below the (100%) put strike level.
+-- Scenario B: the note does not autocall and `finalBarrier` is breached -> tracked redemption.
+runConditionalCouponBarrierReverseConvertible : Script ()
+runConditionalCouponBarrierReverseConvertible = script do
+  infra@Infra{issuer; investor; calendarDataProvider; publicParty; cashInstrument; holdingFactoryCid;
+    investorNoteAccount} <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    referenceAssetId = "SSPA1260-UNDERLYING"
+    initialFixing = 100.0
+    notional = 1000.0
+    couponRate = 0.08
+    putStrike = 1.0
+    finalBarrier = 0.5
+    callBarrier = 1.5
+    couponBarrier = 0.6
+    holidayCalendarIds = ["CHF"]
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+    schedule = createPaymentPeriodicSchedule maturityDate holidayCalendarIds NoAdjustment M 3
+      issueDate maturityDate
+
+  createHolidayCalendar calendarDataProvider "CHF" [issuer, investor, publicParty]
+
+  -- Scenario A: not called, `finalBarrier` (0.50 * 100.0 = 50.0) NOT breached -> full nominal
+  -- protected, even though the spot ended up below the (100%) put strike level.
+  --   spot@final = 70.0 (< callBarrier level 150.0 -> not called; > couponBarrier level 60.0 -> paid;
+  --                       > finalBarrier level 50.0 -> not breached)
+  --   coupon     = notional * couponRate * dcf(0.25) = 1000 * 0.08 * 0.25 = 20.0
+  --   redemption = notional (protected)                                  = 1000.0
+  --   expected total CHF credited to investor                           = 1020.0
+  do
+    noteInstrument <- originateAutoCallable issuer "SSPA1260-PROTECTED" TransferableFungible
+      "Conditional Coupon Barrier Reverse Convertible (protected)" observers lastEventTimestamp
+      putStrike couponBarrier callBarrier finalBarrier cashInstrument referenceAssetId couponRate
+      schedule schedule holidayCalendarIds Act360 notional calendarDataProvider
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(issueDate, initialFixing), (maturityDate, 70.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1260-protected")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1020.0
+
+  -- Scenario B: not called, `finalBarrier` breached -> redemption tracks performance below
+  -- `putStrike`, same as SSPA 1255; the coupon is skipped too (the coupon barrier is breached).
+  --   spot@final = 40.0 (< callBarrier level 150.0 -> not called; <= couponBarrier level 60.0 ->
+  --                       coupon skipped; <= finalBarrier level 50.0 -> breached)
+  --   coupon     = 0.0
+  --   redemption = notional * spot / (putStrike * initialFixing) = 1000 * 40.0 / 100.0 = 400.0
+  --   expected total CHF credited to investor                                         = 400.0
+  do
+    noteInstrument <- originateAutoCallable issuer "SSPA1260-BREACH" TransferableFungible
+      "Conditional Coupon Barrier Reverse Convertible (breach)" observers lastEventTimestamp
+      putStrike couponBarrier callBarrier finalBarrier cashInstrument referenceAssetId couponRate
+      schedule schedule holidayCalendarIds Act360 notional calendarDataProvider
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(issueDate, initialFixing), (maturityDate, 40.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1260-breach")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 400.0
+
+  pure ()

@@ -1,0 +1,143 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Sspa.YieldEnhancement.BarrierDiscountCertificate where
+
+import DA.Date (daysSinceEpochToDate)
+import DA.Set (singleton)
+import Daml.Finance.Claims.V3.Util.Builders
+  (createBarrierEuropeanCashClaim, createFxAdjustedPrincipalClaim)
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Interface.Claims.V4.Claim qualified as Claim (GetClaims(..), I, View(..))
+import Daml.Finance.Interface.Claims.V4.Dynamic.Instrument qualified as DynamicInstrument
+  (CreateNewVersion(..), I, View(..))
+import Daml.Finance.Interface.Claims.V4.Types (EventData)
+import Daml.Finance.Interface.Instrument.Base.V4.Instrument qualified as BaseInstrument
+  (I, View(..), createReference, disclosureUpdateReference, instrumentKey)
+import Daml.Finance.Interface.Types.Common.V3.Types
+  (HoldingStandard(..), Id(..), InstrumentKey(..), PartiesMap)
+import Daml.Finance.Interface.Util.V3.Disclosure qualified as Disclosure (I, View(..), flattenObservers)
+import Daml.Finance.Util.V4.Disclosure (addObserversImpl, removeObserversImpl, setObserversImpl)
+
+-- | SSPA 1210 -- Barrier Discount Certificate.
+--
+-- Like `Sspa.YieldEnhancement.DiscountCertificate` (SSPA 1200), but the short put only knocks IN
+-- (activates) if the underlying touches or breaches the lower `barrier` at some point between
+-- `barrierStartDate` and `maturityDate`. As long as the barrier is never touched, the holder
+-- always receives the full nominal ("the maximum redemption amount") regardless of where the
+-- underlying ends up. If the barrier is touched, the product behaves exactly like a plain Discount
+-- Certificate (1200) from that point on: at maturity the holder receives
+-- `notional * min(spot, strike) / strike`.
+--
+-- Market expectation (per the SSPA Swiss Derivative Map): underlying moving sideways or slightly
+-- rising, falling volatility, underlying will not breach the barrier during the product's
+-- lifetime.
+template Instrument
+  with
+    depository : Party
+      -- ^ The depository of the instrument.
+    issuer : Party
+      -- ^ The issuer of the instrument.
+    id : Id
+      -- ^ An identifier of the instrument.
+    version : Text
+      -- ^ The instrument's version.
+    holdingStandard : HoldingStandard
+      -- ^ The holding standard for holdings referencing this instrument.
+    description : Text
+      -- ^ A description of the instrument.
+    referenceAssetId : Text
+      -- ^ Reference to the underlying's price fixings.
+    strike : Decimal
+      -- ^ The underlying's initial fixing. Also the maximum-redemption ("cap") level.
+    barrier : Decimal
+      -- ^ The lower barrier level. Touching or breaching it activates the short put.
+    barrierStartDate : Date
+      -- ^ The start date for barrier observations.
+    maturityDate : Date
+      -- ^ The maturity date of the certificate.
+    currency : InstrumentKey
+      -- ^ The settlement currency of the product, e.g. a CHF cash instrument.
+    notional : Decimal
+      -- ^ The notional of the product, corresponding to one unit of the product. This is also the
+      --   maximum redemption amount.
+    observers : PartiesMap
+      -- ^ The observers of the instrument.
+    lastEventTimestamp : Time
+      -- ^ (Market) time of the last recorded lifecycle event. If no event has occurred yet, the
+      --   time of creation should be used.
+    prevEvents : [EventData]
+      -- ^ A list of previous events that have been lifecycled on this instrument so far.
+  where
+    signatory depository, issuer
+    observer Disclosure.flattenObservers observers
+
+    interface instance Claim.I for Instrument where
+      view = Claim.View with acquisitionTime = dateToDateClockTime $ daysSinceEpochToDate 0
+      getClaims Claim.GetClaims{} = do
+        let
+          capClaim = createFxAdjustedPrincipalClaim dateToDateClockTime True 1.0 notional currency
+            maturityDate
+          shortPutClaim = createBarrierEuropeanCashClaim dateToDateClockTime False strike
+            referenceAssetId currency maturityDate False barrier barrierStartDate True False
+            (Some strike) notional
+        pure [capClaim, shortPutClaim]
+
+    interface instance BaseInstrument.I for Instrument where
+      view = BaseInstrument.View with
+        depository; issuer; id; version; holdingStandard; description
+        validAsOf = lastEventTimestamp
+      getKey = BaseInstrument.instrumentKey this
+
+    interface instance DynamicInstrument.I for Instrument where
+      view = DynamicInstrument.View with lifecycler = issuer; lastEventTimestamp; prevEvents
+      createNewVersion DynamicInstrument.CreateNewVersion{version; lastEventTimestamp;
+        prevEvents} = do
+          cid <- create this with version; lastEventTimestamp; prevEvents
+          BaseInstrument.createReference issuer $ toInterfaceContractId cid
+          pure $ toInterfaceContractId cid
+
+    interface instance Disclosure.I for Instrument where
+      view = Disclosure.View with disclosureControllers = singleton issuer; observers
+      setObservers = setObserversImpl @Instrument this $
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+      addObservers = addObserversImpl @Instrument this $
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+      removeObservers = removeObserversImpl this .
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+
+-- | Factory to originate `Instrument`s and register them for by-key lookup. The by-key `Reference`
+-- is required by the daml-finance lifecycling and claiming machinery, which addresses instruments
+-- via `InstrumentKey` rather than `ContractId`.
+template Factory
+  with
+    depository : Party
+      -- ^ The depository of instruments created through this factory.
+    issuer : Party
+      -- ^ The issuer of instruments created through this factory.
+  where
+    signatory depository, issuer
+
+    nonconsuming choice Originate : InstrumentKey
+      -- ^ Create a new `Instrument` and its by-key `Reference`.
+      with
+        id : Id
+        description : Text
+        referenceAssetId : Text
+        strike : Decimal
+        barrier : Decimal
+        barrierStartDate : Date
+        maturityDate : Date
+        currency : InstrumentKey
+        notional : Decimal
+        observers : PartiesMap
+        holdingStandard : HoldingStandard
+        lastEventTimestamp : Time
+      controller depository, issuer
+      do
+        cid <- create Instrument with
+          depository; issuer; id; version = "0"; holdingStandard; description; referenceAssetId
+          strike; barrier; barrierStartDate; maturityDate; currency; notional; observers
+          lastEventTimestamp; prevEvents = []
+        BaseInstrument.createReference depository $ toInterfaceContractId cid
+        pure InstrumentKey with depository; issuer; id; version = "0"; holdingStandard

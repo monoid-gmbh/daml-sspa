@@ -1,0 +1,128 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Sspa.Participation.TrackerCertificate where
+
+import DA.Date (daysSinceEpochToDate)
+import DA.Set (singleton)
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Interface.Claims.V4.Claim qualified as Claim (GetClaims(..), I, View(..))
+import Daml.Finance.Interface.Claims.V4.Dynamic.Instrument qualified as DynamicInstrument
+  (CreateNewVersion(..), I, View(..))
+import Daml.Finance.Interface.Claims.V4.Types (EventData)
+import Daml.Finance.Interface.Instrument.Base.V4.Instrument qualified as BaseInstrument
+  (I, View(..), createReference, disclosureUpdateReference, instrumentKey)
+import Daml.Finance.Interface.Types.Common.V3.Types
+  (HoldingStandard(..), Id(..), InstrumentKey(..), PartiesMap)
+import Daml.Finance.Interface.Util.V3.Disclosure qualified as Disclosure (I, View(..), flattenObservers)
+import Daml.Finance.Util.V4.Disclosure (addObserversImpl, removeObserversImpl, setObserversImpl)
+import Sspa.Participation.Util (createTrackerClaim)
+
+-- | SSPA 1300 -- Tracker Certificate.
+--
+-- The simplest participation product: a plain, uncapped, unfloored 1:1 tracker on the underlying,
+-- referenced to its initial fixing (`strike`). At maturity the holder receives
+-- `notional * spot / strike` -- the same direct participation, up or down, as holding the
+-- underlying itself, without dividends/carry.
+--
+-- Market expectation (per the SSPA Swiss Derivative Map): rising underlying.
+template Instrument
+  with
+    depository : Party
+      -- ^ The depository of the instrument.
+    issuer : Party
+      -- ^ The issuer of the instrument.
+    id : Id
+      -- ^ An identifier of the instrument.
+    version : Text
+      -- ^ The instrument's version.
+    holdingStandard : HoldingStandard
+      -- ^ The holding standard for holdings referencing this instrument.
+    description : Text
+      -- ^ A description of the instrument.
+    referenceAssetId : Text
+      -- ^ Reference to the underlying's price fixings.
+    strike : Decimal
+      -- ^ The underlying's initial fixing, used to convert its price into a notional-scaled
+      --   redemption amount.
+    maturityDate : Date
+      -- ^ The maturity date of the certificate.
+    currency : InstrumentKey
+      -- ^ The settlement currency of the product, e.g. a CHF cash instrument.
+    notional : Decimal
+      -- ^ The notional of the product, corresponding to one unit of the product at the strike
+      --   level.
+    observers : PartiesMap
+      -- ^ The observers of the instrument.
+    lastEventTimestamp : Time
+      -- ^ (Market) time of the last recorded lifecycle event. If no event has occurred yet, the
+      --   time of creation should be used.
+    prevEvents : [EventData]
+      -- ^ A list of previous events that have been lifecycled on this instrument so far.
+  where
+    signatory depository, issuer
+    observer Disclosure.flattenObservers observers
+
+    interface instance Claim.I for Instrument where
+      view = Claim.View with acquisitionTime = dateToDateClockTime $ daysSinceEpochToDate 0
+      getClaims Claim.GetClaims{} = do
+        let
+          trackerClaim = createTrackerClaim dateToDateClockTime strike referenceAssetId currency
+            maturityDate notional
+        pure [trackerClaim]
+
+    interface instance BaseInstrument.I for Instrument where
+      view = BaseInstrument.View with
+        depository; issuer; id; version; holdingStandard; description
+        validAsOf = lastEventTimestamp
+      getKey = BaseInstrument.instrumentKey this
+
+    interface instance DynamicInstrument.I for Instrument where
+      view = DynamicInstrument.View with lifecycler = issuer; lastEventTimestamp; prevEvents
+      createNewVersion DynamicInstrument.CreateNewVersion{version; lastEventTimestamp;
+        prevEvents} = do
+          cid <- create this with version; lastEventTimestamp; prevEvents
+          BaseInstrument.createReference issuer $ toInterfaceContractId cid
+          pure $ toInterfaceContractId cid
+
+    interface instance Disclosure.I for Instrument where
+      view = Disclosure.View with disclosureControllers = singleton issuer; observers
+      setObservers = setObserversImpl @Instrument this $
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+      addObservers = addObserversImpl @Instrument this $
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+      removeObservers = removeObserversImpl this .
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+
+-- | Factory to originate `Instrument`s and register them for by-key lookup. The by-key `Reference`
+-- is required by the daml-finance lifecycling and claiming machinery, which addresses instruments
+-- via `InstrumentKey` rather than `ContractId`.
+template Factory
+  with
+    depository : Party
+      -- ^ The depository of instruments created through this factory.
+    issuer : Party
+      -- ^ The issuer of instruments created through this factory.
+  where
+    signatory depository, issuer
+
+    nonconsuming choice Originate : InstrumentKey
+      -- ^ Create a new `Instrument` and its by-key `Reference`.
+      with
+        id : Id
+        description : Text
+        referenceAssetId : Text
+        strike : Decimal
+        maturityDate : Date
+        currency : InstrumentKey
+        notional : Decimal
+        observers : PartiesMap
+        holdingStandard : HoldingStandard
+        lastEventTimestamp : Time
+      controller depository, issuer
+      do
+        cid <- create Instrument with
+          depository; issuer; id; version = "0"; holdingStandard; description; referenceAssetId
+          strike; maturityDate; currency; notional; observers; lastEventTimestamp; prevEvents = []
+        BaseInstrument.createReference depository $ toInterfaceContractId cid
+        pure InstrumentKey with depository; issuer; id; version = "0"; holdingStandard

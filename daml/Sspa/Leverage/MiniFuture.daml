@@ -1,0 +1,159 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Sspa.Leverage.MiniFuture where
+
+import DA.Date (daysSinceEpochToDate)
+import DA.Set (singleton)
+import Daml.Finance.Claims.V3.Util.Builders (createBarrierEuropeanCashClaim)
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Interface.Claims.V4.Claim qualified as Claim (GetClaims(..), I, View(..))
+import Daml.Finance.Interface.Claims.V4.Dynamic.Instrument qualified as DynamicInstrument
+  (CreateNewVersion(..), I, View(..))
+import Daml.Finance.Interface.Claims.V4.Types (EventData)
+import Daml.Finance.Interface.Instrument.Base.V4.Instrument qualified as BaseInstrument
+  (I, View(..), createReference, disclosureUpdateReference, instrumentKey)
+import Daml.Finance.Interface.Types.Common.V3.Types
+  (HoldingStandard(..), Id(..), InstrumentKey(..), PartiesMap)
+import Daml.Finance.Interface.Util.V3.Disclosure qualified as Disclosure (I, View(..), flattenObservers)
+import Daml.Finance.Util.V4.Disclosure (addObserversImpl, removeObserversImpl, setObserversImpl)
+import Sspa.CapitalProtection.Util (createRebateOnBreachClaim)
+
+-- | SSPA 2210 -- Mini-Future.
+--
+-- Modeled as a knock-out option struck at the `financingLevel` (the level "financed" by the
+-- issuer, analogous to a future's forward price), which pays intrinsic value at maturity
+-- (`notional * max(spot - financingLevel, 0) / financingLevel` for a Long, or the mirrored payoff
+-- for a Short), knocked out the moment the underlying touches or breaches `stopLossLevel` (set
+-- above the financing level for a Long, below it for a Short) at any point between
+-- `stopLossStartDate` and `maturityDate` -- at which point a small residual value
+-- (`stopLossResidualRate` of the nominal) is paid instead, reflecting that a stop-loss event
+-- typically still leaves some residual value rather than a total loss.
+--
+-- This is a simplified, static model: real Mini-Futures reset their financing level daily to
+-- accrue the issuer's financing cost, which is not modeled here (hence the SSPA characteristic
+-- "no influence of volatility" -- the payoff here is purely intrinsic-value based, like a real
+-- Mini-Future, just without the daily financing-level drift).
+--
+-- Market expectation (per the SSPA Swiss Derivative Map): Long: rising underlying. Short: falling
+-- underlying.
+template Instrument
+  with
+    depository : Party
+      -- ^ The depository of the instrument.
+    issuer : Party
+      -- ^ The issuer of the instrument.
+    id : Id
+      -- ^ An identifier of the instrument.
+    version : Text
+      -- ^ The instrument's version.
+    holdingStandard : HoldingStandard
+      -- ^ The holding standard for holdings referencing this instrument.
+    description : Text
+      -- ^ A description of the instrument.
+    referenceAssetId : Text
+      -- ^ Reference to the underlying's price fixings.
+    isLong : Bool
+      -- ^ True for a Long Mini-Future (participates in a rising underlying), False for a Short
+      --   Mini-Future (participates in a falling underlying).
+    financingLevel : Decimal
+      -- ^ The level financed by the issuer; intrinsic value is measured relative to this level.
+    stopLossLevel : Decimal
+      -- ^ The stop-loss barrier. For a Long, set above the financing level; for a Short, set below
+      --   it.
+    stopLossStartDate : Date
+      -- ^ The start date for stop-loss observations.
+    stopLossResidualRate : Decimal
+      -- ^ The residual value (as a fraction of the nominal) paid if the stop-loss level is
+      --   touched or breached.
+    maturityDate : Date
+      -- ^ The maturity date.
+    currency : InstrumentKey
+      -- ^ The settlement currency of the product, e.g. a CHF cash instrument.
+    notional : Decimal
+      -- ^ The notional of the product, corresponding to one unit of the product.
+    observers : PartiesMap
+      -- ^ The observers of the instrument.
+    lastEventTimestamp : Time
+      -- ^ (Market) time of the last recorded lifecycle event. If no event has occurred yet, the
+      --   time of creation should be used.
+    prevEvents : [EventData]
+      -- ^ A list of previous events that have been lifecycled on this instrument so far.
+  where
+    signatory depository, issuer
+    observer Disclosure.flattenObservers observers
+
+    interface instance Claim.I for Instrument where
+      view = Claim.View with acquisitionTime = dateToDateClockTime $ daysSinceEpochToDate 0
+      getClaims Claim.GetClaims{} = do
+        let
+          -- For a Long, the stop-loss sits above the financing level (isDown = True: the option
+          -- knocks out when the underlying falls onto/through the stop-loss level from above).
+          -- For a Short, it's mirrored (isDown = False).
+          mainClaim = createBarrierEuropeanCashClaim dateToDateClockTime True financingLevel
+            referenceAssetId currency maturityDate isLong stopLossLevel stopLossStartDate isLong
+            True (Some financingLevel) notional
+          residualClaim = createRebateOnBreachClaim dateToDateClockTime isLong stopLossLevel
+            referenceAssetId currency stopLossStartDate maturityDate stopLossResidualRate notional
+        pure [mainClaim, residualClaim]
+
+    interface instance BaseInstrument.I for Instrument where
+      view = BaseInstrument.View with
+        depository; issuer; id; version; holdingStandard; description
+        validAsOf = lastEventTimestamp
+      getKey = BaseInstrument.instrumentKey this
+
+    interface instance DynamicInstrument.I for Instrument where
+      view = DynamicInstrument.View with lifecycler = issuer; lastEventTimestamp; prevEvents
+      createNewVersion DynamicInstrument.CreateNewVersion{version; lastEventTimestamp;
+        prevEvents} = do
+          cid <- create this with version; lastEventTimestamp; prevEvents
+          BaseInstrument.createReference issuer $ toInterfaceContractId cid
+          pure $ toInterfaceContractId cid
+
+    interface instance Disclosure.I for Instrument where
+      view = Disclosure.View with disclosureControllers = singleton issuer; observers
+      setObservers = setObserversImpl @Instrument this $
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+      addObservers = addObserversImpl @Instrument this $
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+      removeObservers = removeObserversImpl this .
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+
+-- | Factory to originate `Instrument`s and register them for by-key lookup. The by-key `Reference`
+-- is required by the daml-finance lifecycling and claiming machinery, which addresses instruments
+-- via `InstrumentKey` rather than `ContractId`.
+template Factory
+  with
+    depository : Party
+      -- ^ The depository of instruments created through this factory.
+    issuer : Party
+      -- ^ The issuer of instruments created through this factory.
+  where
+    signatory depository, issuer
+
+    nonconsuming choice Originate : InstrumentKey
+      -- ^ Create a new `Instrument` and its by-key `Reference`.
+      with
+        id : Id
+        description : Text
+        referenceAssetId : Text
+        isLong : Bool
+        financingLevel : Decimal
+        stopLossLevel : Decimal
+        stopLossStartDate : Date
+        stopLossResidualRate : Decimal
+        maturityDate : Date
+        currency : InstrumentKey
+        notional : Decimal
+        observers : PartiesMap
+        holdingStandard : HoldingStandard
+        lastEventTimestamp : Time
+      controller depository, issuer
+      do
+        cid <- create Instrument with
+          depository; issuer; id; version = "0"; holdingStandard; description; referenceAssetId
+          isLong; financingLevel; stopLossLevel; stopLossStartDate; stopLossResidualRate
+          maturityDate; currency; notional; observers; lastEventTimestamp; prevEvents = []
+        BaseInstrument.createReference depository $ toInterfaceContractId cid
+        pure InstrumentKey with depository; issuer; id; version = "0"; holdingStandard

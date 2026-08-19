@@ -1,0 +1,28 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | SSPA 1260 -- Conditional Coupon Barrier Reverse Convertible.
+--
+-- This maps onto daml-finance's own
+-- `Daml.Finance.Instrument.StructuredProduct.V0.AutoCallable` package: on each observation date, a
+-- coupon is paid only if the underlying is quoted at or above `couponBarrier` ("coupon at risk");
+-- if the underlying is quoted at or above `callBarrier`, the note is redeemed early at par plus
+-- the current coupon (the autocall trigger); if the note survives to the final observation date,
+-- full nominal redemption is protected as long as the underlying has not touched or breached
+-- `finalBarrier` (set strictly below `putStrike`) -- otherwise redemption tracks the underlying's
+-- performance below `putStrike`, same as SSPA 1255.
+--
+-- Compared to `Sspa.YieldEnhancement.ConditionalCouponReverseConvertible` (SSPA 1255, otherwise
+-- identical product conditions), setting `finalBarrier < putStrike` here makes full repayment more
+-- likely, at the cost of a lower conditional coupon for the same market price -- exactly the
+-- trade-off the SSPA taxonomy describes between 1255 and 1260.
+--
+-- We reuse daml-finance's implementation as-is here rather than reimplementing an equivalent
+-- instrument from scratch.
+module Sspa.YieldEnhancement.ConditionalCouponBarrierReverseConvertible
+  ( Instrument(..)
+  , Factory(..)
+  ) where
+
+import Daml.Finance.Instrument.StructuredProduct.V0.AutoCallable.Factory (Factory(..))
+import Daml.Finance.Instrument.StructuredProduct.V0.AutoCallable.Instrument (Instrument(..))

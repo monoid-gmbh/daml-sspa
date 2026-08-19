@@ -1,0 +1,150 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Sspa.Participation.BonusOutperformanceCertificate where
+
+import DA.Date (daysSinceEpochToDate)
+import DA.Set (singleton)
+import Daml.Finance.Claims.V3.Util.Builders
+  (createBarrierEuropeanCashClaim, createEuropeanCashClaim)
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Interface.Claims.V4.Claim qualified as Claim (GetClaims(..), I, View(..))
+import Daml.Finance.Interface.Claims.V4.Dynamic.Instrument qualified as DynamicInstrument
+  (CreateNewVersion(..), I, View(..))
+import Daml.Finance.Interface.Claims.V4.Types (EventData)
+import Daml.Finance.Interface.Instrument.Base.V4.Instrument qualified as BaseInstrument
+  (I, View(..), createReference, disclosureUpdateReference, instrumentKey)
+import Daml.Finance.Interface.Types.Common.V3.Types
+  (HoldingStandard(..), Id(..), InstrumentKey(..), PartiesMap)
+import Daml.Finance.Interface.Util.V3.Disclosure qualified as Disclosure (I, View(..), flattenObservers)
+import Daml.Finance.Util.V4.Disclosure (addObserversImpl, removeObserversImpl, setObserversImpl)
+import Sspa.Participation.Util (createTrackerClaim)
+
+-- | SSPA 1330 -- Bonus Outperformance Certificate.
+--
+-- Combines `Sspa.Participation.OutperformanceCertificate` (SSPA 1310) and
+-- `Sspa.Participation.BonusCertificate` (SSPA 1320): a plain 1:1 tracker, plus a long call struck
+-- at `strike` (scaled by `participationRate - 1.0`) for disproportionate upside participation,
+-- plus a long down-and-out put struck at `strike` that provides a bonus floor at the nominal as
+-- long as the underlying never touches or breaches the lower `barrier`. If the barrier is
+-- breached, the bonus floor is permanently removed and the product becomes a plain Outperformance
+-- Certificate (1310) from that point on.
+--
+-- Market expectation (per the SSPA Swiss Derivative Map): rising underlying; the underlying will
+-- not breach the barrier during the product's lifetime.
+template Instrument
+  with
+    depository : Party
+      -- ^ The depository of the instrument.
+    issuer : Party
+      -- ^ The issuer of the instrument.
+    id : Id
+      -- ^ An identifier of the instrument.
+    version : Text
+      -- ^ The instrument's version.
+    holdingStandard : HoldingStandard
+      -- ^ The holding standard for holdings referencing this instrument.
+    description : Text
+      -- ^ A description of the instrument.
+    referenceAssetId : Text
+      -- ^ Reference to the underlying's price fixings.
+    strike : Decimal
+      -- ^ The underlying's initial fixing. Also the bonus-protected redemption level and the
+      --   level above which disproportionate participation applies.
+    participationRate : Decimal
+      -- ^ The disproportionate participation rate above the strike (e.g. 1.5 for 150%).
+    barrier : Decimal
+      -- ^ The lower barrier level. Touching or breaching it permanently removes the bonus floor.
+    barrierStartDate : Date
+      -- ^ The start date for barrier observations.
+    maturityDate : Date
+      -- ^ The maturity date of the certificate.
+    currency : InstrumentKey
+      -- ^ The settlement currency of the product, e.g. a CHF cash instrument.
+    notional : Decimal
+      -- ^ The notional of the product, corresponding to one unit of the product at the strike
+      --   level. Also the "bonus" minimum redemption amount while the barrier holds.
+    observers : PartiesMap
+      -- ^ The observers of the instrument.
+    lastEventTimestamp : Time
+      -- ^ (Market) time of the last recorded lifecycle event. If no event has occurred yet, the
+      --   time of creation should be used.
+    prevEvents : [EventData]
+      -- ^ A list of previous events that have been lifecycled on this instrument so far.
+  where
+    signatory depository, issuer
+    observer Disclosure.flattenObservers observers
+
+    interface instance Claim.I for Instrument where
+      view = Claim.View with acquisitionTime = dateToDateClockTime $ daysSinceEpochToDate 0
+      getClaims Claim.GetClaims{} = do
+        let
+          trackerClaim = createTrackerClaim dateToDateClockTime strike referenceAssetId currency
+            maturityDate notional
+          outperformanceClaim = createEuropeanCashClaim dateToDateClockTime True strike
+            referenceAssetId currency maturityDate True (Some strike)
+            ((participationRate - 1.0) * notional)
+          bonusPutClaim = createBarrierEuropeanCashClaim dateToDateClockTime True strike
+            referenceAssetId currency maturityDate False barrier barrierStartDate True True
+            (Some strike) notional
+        pure [trackerClaim, outperformanceClaim, bonusPutClaim]
+
+    interface instance BaseInstrument.I for Instrument where
+      view = BaseInstrument.View with
+        depository; issuer; id; version; holdingStandard; description
+        validAsOf = lastEventTimestamp
+      getKey = BaseInstrument.instrumentKey this
+
+    interface instance DynamicInstrument.I for Instrument where
+      view = DynamicInstrument.View with lifecycler = issuer; lastEventTimestamp; prevEvents
+      createNewVersion DynamicInstrument.CreateNewVersion{version; lastEventTimestamp;
+        prevEvents} = do
+          cid <- create this with version; lastEventTimestamp; prevEvents
+          BaseInstrument.createReference issuer $ toInterfaceContractId cid
+          pure $ toInterfaceContractId cid
+
+    interface instance Disclosure.I for Instrument where
+      view = Disclosure.View with disclosureControllers = singleton issuer; observers
+      setObservers = setObserversImpl @Instrument this $
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+      addObservers = addObserversImpl @Instrument this $
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+      removeObservers = removeObserversImpl this .
+        Some . BaseInstrument.disclosureUpdateReference $ BaseInstrument.instrumentKey this
+
+-- | Factory to originate `Instrument`s and register them for by-key lookup. The by-key `Reference`
+-- is required by the daml-finance lifecycling and claiming machinery, which addresses instruments
+-- via `InstrumentKey` rather than `ContractId`.
+template Factory
+  with
+    depository : Party
+      -- ^ The depository of instruments created through this factory.
+    issuer : Party
+      -- ^ The issuer of instruments created through this factory.
+  where
+    signatory depository, issuer
+
+    nonconsuming choice Originate : InstrumentKey
+      -- ^ Create a new `Instrument` and its by-key `Reference`.
+      with
+        id : Id
+        description : Text
+        referenceAssetId : Text
+        strike : Decimal
+        participationRate : Decimal
+        barrier : Decimal
+        barrierStartDate : Date
+        maturityDate : Date
+        currency : InstrumentKey
+        notional : Decimal
+        observers : PartiesMap
+        holdingStandard : HoldingStandard
+        lastEventTimestamp : Time
+      controller depository, issuer
+      do
+        cid <- create Instrument with
+          depository; issuer; id; version = "0"; holdingStandard; description; referenceAssetId
+          strike; participationRate; barrier; barrierStartDate; maturityDate; currency; notional
+          observers; lastEventTimestamp; prevEvents = []
+        BaseInstrument.createReference depository $ toInterfaceContractId cid
+        pure InstrumentKey with depository; issuer; id; version = "0"; holdingStandard

@@ -1,0 +1,424 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | End-to-end Daml Script scenarios for the four SSPA "Additional credit risk" products. Each
+-- scenario originates a note, mints it into the investor's holding, lifecycles the underlying claim
+-- tree forward through one or more market events (feeding it price fixings -- where applicable -- and
+-- the credit-event/recovery-rate fixings via `Observation` contracts), and then claims + fully
+-- settles every `Effect` produced -- asserting the investor's actual CHF holding balance at each step.
+-- Expected amounts are computed by hand in the comments so that each assertion is self-documenting.
+--
+-- Every product here is a category 11/12/13 product (capital protection, participation or yield
+-- enhancement) whose payoff is additionally conditional on no credit event of a reference entity
+-- having occurred (`Sspa.CreditRisk.Util.untilCreditEvent`); if a credit event does occur, the
+-- holder instead receives a one-off `notional * (1 - recoveryRate)` recovery payment
+-- (`Daml.Finance.Claims.V3.Util.Builders.createCreditEventPaymentClaims`) and forfeits every other
+-- leg from that point on. Empirically (confirmed by probing each product below), once that recovery
+-- payment is claimed the note holding is fully consumed (`noteHoldingCid = None`) and the instrument
+-- no longer versions forward or produces any further `Effect`s -- so each credit-event scenario below
+-- claims the recovery payment once, then lifecycles the instrument one more time at maturity and
+-- asserts that this produces no new instrument version and no `Effect`s at all.
+module Sspa.Test.CreditRisk where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Map qualified as Map
+import DA.Set qualified as Set
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Interface.Types.Common.V3.Types (HoldingStandard(..), Id(..))
+import Daml.Finance.Interface.Types.Date.V3.Calendar (BusinessDayConventionEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.DayCount (DayCountConventionEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.RollConvention (PeriodEnum(..))
+import Daml.Script
+import Sspa.CreditRisk.ConditionalCapitalProtectionNote qualified as ConditionalCapitalProtectionNote
+import Sspa.CreditRisk.CreditLinkedNote qualified as CreditLinkedNote
+import Sspa.CreditRisk.ParticipationCertificate qualified as ParticipationCertificate
+import Sspa.CreditRisk.YieldEnhancementCertificate qualified as YieldEnhancementCertificate
+import Sspa.Test.Setup
+
+-- | SSPA 1400 -- Credit Linked Notes.
+--
+-- Scenario A: no credit event -> the fixed coupon and full nominal redemption are both paid at
+-- maturity (this product has a single quarterly coupon period spanning its whole life, so both fall
+-- due on the same date).
+-- Scenario B: a credit event occurs partway through the (single) coupon period -> the coupon and
+-- redemption are forfeited entirely, and a one-off recovery payment is made instead.
+runCreditLinkedNote : Script ()
+runCreditLinkedNote = script do
+  infra@Infra{issuer; investor; calendarDataProvider; publicParty; cashInstrument; holdingFactoryCid;
+    investorNoteAccount} <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1 -- 90 actual days after issueDate (2026 is not a leap year)
+    breachDate = date 2026 Feb 15
+    couponRate = 0.05
+    notional = 1000.0
+    recoveryRate = 0.4
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+    -- A single coupon/redemption period spanning the note's whole life: [issueDate, maturityDate].
+    -- This keeps the Act360 day-count fraction an exact 90/360 = 0.25, avoiding any rounding.
+    periodicSchedule =
+      createPaymentPeriodicSchedule maturityDate ["CHF"] NoAdjustment M 3 issueDate maturityDate
+
+  createHolidayCalendar calendarDataProvider "CHF" [issuer, investor, publicParty]
+
+  -- Scenario A: no credit event throughout.
+  --   coupon     = notional * couponRate * (90/360) = 1000 * 0.05 * 0.25 = 12.5
+  --   redemption = notional                                             = 1000.0
+  --   expected total CHF credited to investor at maturity               = 1012.5
+  do
+    factoryCid <- submit issuer do
+      createCmd CreditLinkedNote.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid CreditLinkedNote.Originate with
+        id = Id "SSPA1400-NOEVENT"; description = "Credit Linked Note (no credit event)"
+        referenceEntityId = "SSPA1400-ENTITY"; defaultProbabilityReferenceId = "SSPA1400-PD-A"
+        recoveryRateReferenceId = "SSPA1400-RR-A"; couponRate; periodicSchedule
+        holidayCalendarIds = ["CHF"]; calendarDataProvider; dayCountConvention = Act360
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    -- A fixing at issueDate is required too: the credit-event claim's own effective-date guard is
+    -- evaluated as a synthetic checkpoint at inception while fast-forwarding, and that needs to
+    -- resolve the `Observe` node for the default-probability observable (mirrors the barrierStartDate
+    -- comment in `Sspa.Test.CapitalProtection.runBarrier`).
+    pdObsCid <- createObservation issuer "SSPA1400-PD-A" [(issueDate, 0.0), (maturityDate, 0.0)]
+    rrObsCid <- createObservation issuer "SSPA1400-RR-A"
+      [(issueDate, recoveryRate), (maturityDate, recoveryRate)]
+
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [pdObsCid, rrObsCid]
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1400-noevent")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1012.5
+
+  -- Scenario B: credit event at breachDate (Feb 15, inside the note's only coupon period).
+  --   recovery = notional * (1 - recoveryRate) = 1000 * (1 - 0.4) = 600.0, paid at the breach date
+  --   no coupon, no redemption is ever paid -- confirmed by re-lifecycling to maturity and asserting
+  --   no new instrument version / no further Effects are produced.
+  do
+    factoryCid <- submit issuer do
+      createCmd CreditLinkedNote.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid CreditLinkedNote.Originate with
+        id = Id "SSPA1400-EVENT"; description = "Credit Linked Note (credit event)"
+        referenceEntityId = "SSPA1400-ENTITY"; defaultProbabilityReferenceId = "SSPA1400-PD-B"
+        recoveryRateReferenceId = "SSPA1400-RR-B"; couponRate; periodicSchedule
+        holidayCalendarIds = ["CHF"]; calendarDataProvider; dayCountConvention = Act360
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    pdObsCid <- createObservation issuer "SSPA1400-PD-B"
+      [(issueDate, 0.0), (breachDate, 1.0), (maturityDate, 1.0)]
+    rrObsCid <- createObservation issuer "SSPA1400-RR-B"
+      [(issueDate, recoveryRate), (breachDate, recoveryRate), (maturityDate, recoveryRate)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0 [pdObsCid, rrObsCid]
+    breachResult <- claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1400-breach")
+    Some recoveryCashCid <- pure breachResult.cashHoldingCid
+    recoveryTotal <- sumHoldingAmounts investor [recoveryCashCid]
+    recoveryTotal === 600.0
+    -- The note is fully redeemed by the recovery payment: no note holding survives the claim.
+    breachResult.noteHoldingCid === None
+
+    (maturityInstr, maturityEffects) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1 [pdObsCid, rrObsCid]
+    maturityInstr === None
+    maturityEffects === []
+
+  pure ()
+
+-- | SSPA 1410 -- Conditional Capital Protection Note with additional credit risk.
+--
+-- Identical payoff structure to `Sspa.Test.CapitalProtection.runParticipation` (protected principal
+-- plus a long call above the strike), but conditional on no credit event.
+--
+-- Scenario A: no credit event, underlying finishes above the strike -> protection + participation.
+-- Scenario B: a credit event occurs partway through -> protection and participation are forfeited
+-- entirely, and a one-off recovery payment is made instead.
+runConditionalCapitalProtectionNote : Script ()
+runConditionalCapitalProtectionNote = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA1410-UNDERLYING"
+    strike = 100.0
+    protectionLevel = 1.0
+    participationRate = 1.0
+    notional = 1000.0
+    recoveryRate = 0.4
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: no credit event, spot@maturity = 120.0.
+  --   participation = notional * participationRate * max(0, 120/100 - 1) = 1000 * 0.2 = 200.0
+  --   protection    = notional * protectionLevel                                     = 1000.0
+  --   expected total CHF credited to investor                                       = 1200.0
+  do
+    factoryCid <- submit issuer do
+      createCmd ConditionalCapitalProtectionNote.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid ConditionalCapitalProtectionNote.Originate with
+        id = Id "SSPA1410-NOEVENT"
+        description = "Conditional Capital Protection Note (no credit event)"; referenceAssetId
+        referenceEntityId = "SSPA1410-ENTITY"; defaultProbabilityReferenceId = "SSPA1410-PD-A"
+        recoveryRateReferenceId = "SSPA1410-RR-A"; strike; protectionLevel; participationRate
+        issueDate; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    priceObsCid <- createObservation issuer referenceAssetId [(issueDate, strike), (maturityDate, 120.0)]
+    pdObsCid <- createObservation issuer "SSPA1410-PD-A" [(issueDate, 0.0), (maturityDate, 0.0)]
+    rrObsCid <- createObservation issuer "SSPA1410-RR-A"
+      [(issueDate, recoveryRate), (maturityDate, recoveryRate)]
+
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument
+        [priceObsCid, pdObsCid, rrObsCid]
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1410-noevent")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1200.0
+
+  -- Scenario B: credit event at breachDate.
+  --   recovery = notional * (1 - recoveryRate) = 1000 * (1 - 0.4) = 600.0, paid at the breach date
+  --   no protection, no participation is ever paid, regardless of the underlying's subsequent path.
+  do
+    factoryCid <- submit issuer do
+      createCmd ConditionalCapitalProtectionNote.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid ConditionalCapitalProtectionNote.Originate with
+        id = Id "SSPA1410-EVENT"
+        description = "Conditional Capital Protection Note (credit event)"; referenceAssetId
+        referenceEntityId = "SSPA1410-ENTITY"; defaultProbabilityReferenceId = "SSPA1410-PD-B"
+        recoveryRateReferenceId = "SSPA1410-RR-B"; strike; protectionLevel; participationRate
+        issueDate; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    -- Underlying keeps rising even after the breach (130.0 at maturity, well above strike) to make
+    -- clear that the eventual maturity fixing has no bearing once the credit event has fired.
+    priceObsCid <- createObservation issuer referenceAssetId
+      [(issueDate, strike), (breachDate, 110.0), (maturityDate, 130.0)]
+    pdObsCid <- createObservation issuer "SSPA1410-PD-B"
+      [(issueDate, 0.0), (breachDate, 1.0), (maturityDate, 1.0)]
+    rrObsCid <- createObservation issuer "SSPA1410-RR-B"
+      [(issueDate, recoveryRate), (breachDate, recoveryRate), (maturityDate, recoveryRate)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0
+        [priceObsCid, pdObsCid, rrObsCid]
+    breachResult <- claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1410-breach")
+    Some recoveryCashCid <- pure breachResult.cashHoldingCid
+    recoveryTotal <- sumHoldingAmounts investor [recoveryCashCid]
+    recoveryTotal === 600.0
+    breachResult.noteHoldingCid === None
+
+    (maturityInstr, maturityEffects) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1
+        [priceObsCid, pdObsCid, rrObsCid]
+    maturityInstr === None
+    maturityEffects === []
+
+  pure ()
+
+-- | SSPA 1420 -- Yield Enhancement Certificate with additional credit risk.
+--
+-- Identical payoff structure to `Sspa.YieldEnhancement.ReverseConvertible` (fixed coupon plus a
+-- short put struck at `strike`), but conditional on no credit event.
+--
+-- Scenario A: no credit event, underlying finishes below the strike (put ITM) -> coupon plus
+-- notional * min(spot, strike) / strike at maturity.
+-- Scenario B: a credit event occurs partway through -> coupon and redemption are forfeited entirely,
+-- and a one-off recovery payment is made instead.
+runYieldEnhancementCertificate : Script ()
+runYieldEnhancementCertificate = script do
+  infra@Infra{issuer; investor; calendarDataProvider; publicParty; cashInstrument; holdingFactoryCid;
+    investorNoteAccount} <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1 -- 90 actual days after issueDate
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA1420-UNDERLYING"
+    strike = 100.0
+    couponRate = 0.05
+    notional = 1000.0
+    recoveryRate = 0.4
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+    -- A single coupon period spanning the note's whole life, for the same reason as SSPA 1400.
+    periodicSchedule =
+      createPaymentPeriodicSchedule maturityDate ["CHF"] NoAdjustment M 3 issueDate maturityDate
+
+  createHolidayCalendar calendarDataProvider "CHF" [issuer, investor, publicParty]
+
+  -- Scenario A: no credit event, spot@maturity = 90.0 (put ITM, since spot < strike).
+  --   coupon     = notional * couponRate * (90/360)          = 1000 * 0.05 * 0.25 = 12.5
+  --   redemption = notional * min(90.0, 100.0) / 100.0        = 1000 * 90 / 100    = 900.0
+  --   expected total CHF credited to investor at maturity                        = 912.5
+  do
+    factoryCid <- submit issuer do
+      createCmd YieldEnhancementCertificate.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid YieldEnhancementCertificate.Originate with
+        id = Id "SSPA1420-NOEVENT"; description = "Yield Enhancement Certificate (no credit event)"
+        referenceAssetId; referenceEntityId = "SSPA1420-ENTITY"
+        defaultProbabilityReferenceId = "SSPA1420-PD-A"; recoveryRateReferenceId = "SSPA1420-RR-A"
+        strike; couponRate; periodicSchedule; holidayCalendarIds = ["CHF"]; calendarDataProvider
+        dayCountConvention = Act360; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    priceObsCid <- createObservation issuer referenceAssetId [(issueDate, strike), (maturityDate, 90.0)]
+    pdObsCid <- createObservation issuer "SSPA1420-PD-A" [(issueDate, 0.0), (maturityDate, 0.0)]
+    rrObsCid <- createObservation issuer "SSPA1420-RR-A"
+      [(issueDate, recoveryRate), (maturityDate, recoveryRate)]
+
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument
+        [priceObsCid, pdObsCid, rrObsCid]
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1420-noevent")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 912.5
+
+  -- Scenario B: credit event at breachDate.
+  --   recovery = notional * (1 - recoveryRate) = 1000 * (1 - 0.4) = 600.0, paid at the breach date
+  --   no coupon, no redemption is ever paid.
+  do
+    factoryCid <- submit issuer do
+      createCmd YieldEnhancementCertificate.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid YieldEnhancementCertificate.Originate with
+        id = Id "SSPA1420-EVENT"; description = "Yield Enhancement Certificate (credit event)"
+        referenceAssetId; referenceEntityId = "SSPA1420-ENTITY"
+        defaultProbabilityReferenceId = "SSPA1420-PD-B"; recoveryRateReferenceId = "SSPA1420-RR-B"
+        strike; couponRate; periodicSchedule; holidayCalendarIds = ["CHF"]; calendarDataProvider
+        dayCountConvention = Act360; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    priceObsCid <- createObservation issuer referenceAssetId
+      [(issueDate, strike), (breachDate, 90.0), (maturityDate, 90.0)]
+    pdObsCid <- createObservation issuer "SSPA1420-PD-B"
+      [(issueDate, 0.0), (breachDate, 1.0), (maturityDate, 1.0)]
+    rrObsCid <- createObservation issuer "SSPA1420-RR-B"
+      [(issueDate, recoveryRate), (breachDate, recoveryRate), (maturityDate, recoveryRate)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0
+        [priceObsCid, pdObsCid, rrObsCid]
+    breachResult <- claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1420-breach")
+    Some recoveryCashCid <- pure breachResult.cashHoldingCid
+    recoveryTotal <- sumHoldingAmounts investor [recoveryCashCid]
+    recoveryTotal === 600.0
+    breachResult.noteHoldingCid === None
+
+    (maturityInstr, maturityEffects) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1
+        [priceObsCid, pdObsCid, rrObsCid]
+    maturityInstr === None
+    maturityEffects === []
+
+  pure ()
+
+-- | SSPA 1430 -- Participation Certificate with additional credit risk.
+--
+-- Identical payoff structure to `Sspa.Participation.TrackerCertificate` (a plain 1:1 tracker), but
+-- conditional on no credit event.
+--
+-- Scenario A: no credit event, underlying finishes above the strike -> plain tracker payoff.
+-- Scenario B: a credit event occurs partway through -> the tracker payoff is forfeited entirely, and
+-- a one-off recovery payment is made instead.
+runParticipationCertificate : Script ()
+runParticipationCertificate = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA1430-UNDERLYING"
+    strike = 100.0
+    notional = 1000.0
+    recoveryRate = 0.4
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: no credit event, spot@maturity = 120.0.
+  --   tracker = notional * spot / strike = 1000 * 120 / 100 = 1200.0
+  do
+    factoryCid <- submit issuer do
+      createCmd ParticipationCertificate.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid ParticipationCertificate.Originate with
+        id = Id "SSPA1430-NOEVENT"; description = "Participation Certificate (no credit event)"
+        referenceAssetId; referenceEntityId = "SSPA1430-ENTITY"
+        defaultProbabilityReferenceId = "SSPA1430-PD-A"; recoveryRateReferenceId = "SSPA1430-RR-A"
+        strike; issueDate; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    priceObsCid <- createObservation issuer referenceAssetId [(issueDate, strike), (maturityDate, 120.0)]
+    pdObsCid <- createObservation issuer "SSPA1430-PD-A" [(issueDate, 0.0), (maturityDate, 0.0)]
+    rrObsCid <- createObservation issuer "SSPA1430-RR-A"
+      [(issueDate, recoveryRate), (maturityDate, recoveryRate)]
+
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument
+        [priceObsCid, pdObsCid, rrObsCid]
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1430-noevent")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1200.0
+
+  -- Scenario B: credit event at breachDate.
+  --   recovery = notional * (1 - recoveryRate) = 1000 * (1 - 0.4) = 600.0, paid at the breach date
+  --   no tracker payoff is ever paid, regardless of the underlying's subsequent path.
+  do
+    factoryCid <- submit issuer do
+      createCmd ParticipationCertificate.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid ParticipationCertificate.Originate with
+        id = Id "SSPA1430-EVENT"; description = "Participation Certificate (credit event)"
+        referenceAssetId; referenceEntityId = "SSPA1430-ENTITY"
+        defaultProbabilityReferenceId = "SSPA1430-PD-B"; recoveryRateReferenceId = "SSPA1430-RR-B"
+        strike; issueDate; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    priceObsCid <- createObservation issuer referenceAssetId
+      [(issueDate, strike), (breachDate, 110.0), (maturityDate, 130.0)]
+    pdObsCid <- createObservation issuer "SSPA1430-PD-B"
+      [(issueDate, 0.0), (breachDate, 1.0), (maturityDate, 1.0)]
+    rrObsCid <- createObservation issuer "SSPA1430-RR-B"
+      [(issueDate, recoveryRate), (breachDate, recoveryRate), (maturityDate, recoveryRate)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0
+        [priceObsCid, pdObsCid, rrObsCid]
+    breachResult <- claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1430-breach")
+    Some recoveryCashCid <- pure breachResult.cashHoldingCid
+    recoveryTotal <- sumHoldingAmounts investor [recoveryCashCid]
+    recoveryTotal === 600.0
+    breachResult.noteHoldingCid === None
+
+    (maturityInstr, maturityEffects) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1
+        [priceObsCid, pdObsCid, rrObsCid]
+    maturityInstr === None
+    maturityEffects === []
+
+  pure ()

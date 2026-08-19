@@ -1,0 +1,408 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | End-to-end Daml Script scenarios for the five SSPA Participation products. Each scenario
+-- originates a note, mints it into the investor's holding, lifecycles the underlying claim tree
+-- forward through one or more market events (feeding it price fixings via an `Observation`
+-- contract), and then claims + fully settles every `Effect` produced -- asserting the investor's
+-- actual CHF holding balance at each step. Expected amounts are computed by hand in the comments so
+-- that each assertion is self-documenting.
+module Sspa.Test.Participation where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Map qualified as Map
+import DA.Set qualified as Set
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Interface.Types.Common.V3.Types (HoldingStandard(..), Id(..))
+import Daml.Script
+import Sspa.Participation.BonusCertificate qualified as Bonus
+import Sspa.Participation.BonusOutperformanceCertificate qualified as BonusOutperformance
+import Sspa.Participation.OutperformanceCertificate qualified as Outperformance
+import Sspa.Participation.TrackerCertificate qualified as Tracker
+import Sspa.Participation.TwinWinCertificate qualified as TwinWin
+import Sspa.Test.Setup
+
+-- | SSPA 1300 -- Tracker Certificate.
+--
+-- Scenario A: the underlying finishes above the strike -> tracker gain.
+-- Scenario B: the underlying finishes below the strike -> tracker loss (no floor).
+runTracker : Script ()
+runTracker = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    referenceAssetId = "SSPA1300-UNDERLYING"
+    strike = 100.0
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: spot@maturity = 120.0 -> tracker = notional * 120/100 = 1200.0
+  do
+    factoryCid <- submit issuer do createCmd Tracker.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid Tracker.Originate with
+        id = Id "SSPA1300-UP"; description = "Tracker Certificate (up)"
+        referenceAssetId; strike; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 120.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1300-up")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1200.0
+
+  -- Scenario B: spot@maturity = 80.0 -> tracker = notional * 80/100 = 800.0
+  do
+    factoryCid <- submit issuer do createCmd Tracker.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid Tracker.Originate with
+        id = Id "SSPA1300-DOWN"; description = "Tracker Certificate (down)"
+        referenceAssetId; strike; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 80.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1300-down")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 800.0
+
+  pure ()
+
+-- | SSPA 1310 -- Outperformance Certificate.
+--
+-- Scenario A: the underlying finishes above the strike -> tracker + disproportionate call.
+-- Scenario B: the underlying finishes below the strike -> tracker only, call pays nothing.
+runOutperformance : Script ()
+runOutperformance = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    referenceAssetId = "SSPA1310-UNDERLYING"
+    strike = 100.0
+    participationRate = 1.5
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: spot@maturity = 120.0
+  --   tracker = notional * 120/100                                 = 1200.0
+  --   call    = notional * (participationRate - 1) * max(0, 1.2-1) = 1000 * 0.5 * 0.2 = 100.0
+  --   expected total CHF credited to investor                      = 1300.0
+  do
+    factoryCid <- submit issuer do createCmd Outperformance.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid Outperformance.Originate with
+        id = Id "SSPA1310-ITM"; description = "Outperformance Certificate (ITM)"
+        referenceAssetId; strike; participationRate; maturityDate; currency = cashInstrument
+        notional; observers; holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 120.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1310-itm")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1300.0
+
+  -- Scenario B: spot@maturity = 90.0 -> call = 0 (below strike)
+  --   expected total CHF credited to investor = 900.0 (tracker only)
+  do
+    factoryCid <- submit issuer do createCmd Outperformance.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid Outperformance.Originate with
+        id = Id "SSPA1310-OTM"; description = "Outperformance Certificate (OTM)"
+        referenceAssetId; strike; participationRate; maturityDate; currency = cashInstrument
+        notional; observers; holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 90.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1310-otm")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 900.0
+
+  pure ()
+
+-- | SSPA 1320 -- Bonus Certificate.
+--
+-- Scenario A: the (lower) barrier is never touched, underlying finishes below the strike -> tracker
+-- + bonus put exactly offset the shortfall, redemption floored at the nominal.
+-- Scenario B: the barrier is touched at an interim date -> the bonus put knocks out for good; the
+-- product becomes a plain Tracker Certificate for the remainder of its life.
+runBonus : Script ()
+runBonus = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA1320-UNDERLYING"
+    strike = 100.0
+    barrier = 70.0
+    barrierStartDate = issueDate
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: barrier never touched (only checked at maturity, comfortably above 70.0).
+  --   spot@maturity = 90.0
+  --   tracker = notional * 90/100          = 900.0
+  --   bonus put = notional * (1 - 90/100)  = 100.0
+  --   expected total CHF credited to investor = 1000.0 (bonus floor)
+  do
+    factoryCid <- submit issuer do createCmd Bonus.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid Bonus.Originate with
+        id = Id "SSPA1320-NOBREACH"; description = "Bonus Certificate (no breach)"
+        referenceAssetId; strike; barrier; barrierStartDate; maturityDate; currency = cashInstrument
+        notional; observers; holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    -- An observation at `barrierStartDate` is required too: it coincides here with the
+    -- instrument's inception, which the lifecycle engine processes as a synthetic time-event
+    -- checkpoint while fast-forwarding, and evaluating the claim tree's `at barrierStartDate`
+    -- node at that checkpoint needs to resolve the barrier condition's `Observe`.
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (maturityDate, 90.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1320-nobreach")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1000.0
+
+  -- Scenario B: barrier touched at breachDate, spot@breachDate = 65.0 (<= barrier 70.0) -> bonus
+  -- put knocked out for the rest of the note's life; no cash is produced by the touch event itself.
+  --   spot@maturity = 80.0 -> tracker only = notional * 80/100 = 800.0
+  do
+    factoryCid <- submit issuer do createCmd Bonus.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid Bonus.Originate with
+        id = Id "SSPA1320-BREACH"; description = "Bonus Certificate (breach)"
+        referenceAssetId; strike; barrier; barrierStartDate; maturityDate; currency = cashInstrument
+        notional; observers; holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (breachDate, 65.0), (maturityDate, 80.0)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0 [obsCid]
+    breachResult <-
+      claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1320-breach-touch")
+    -- No cash should be produced purely by the barrier touch itself.
+    breachResult.cashHoldingCid === None
+    Some noteHoldingCid1 <- pure breachResult.noteHoldingCid
+
+    (_, [maturityEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1 [obsCid]
+    maturityResult <-
+      claimAndSettle infra noteHoldingCid1 maturityEffectCid (Id "settle-1320-breach-maturity")
+    Some maturityCashCid <- pure maturityResult.cashHoldingCid
+    maturityTotal <- sumHoldingAmounts investor [maturityCashCid]
+    maturityTotal === 800.0
+
+  pure ()
+
+-- | SSPA 1330 -- Bonus Outperformance Certificate.
+--
+-- Scenario A: the (lower) barrier is never touched, underlying finishes below the strike -> tracker
+-- + bonus put offset the shortfall, redemption floored at the nominal (the outperformance call pays
+-- nothing since the underlying is below the strike).
+-- Scenario B: the barrier is touched at an interim date -> the bonus put knocks out for good; the
+-- product becomes a plain Outperformance Certificate for the remainder of its life.
+runBonusOutperformance : Script ()
+runBonusOutperformance = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA1330-UNDERLYING"
+    strike = 100.0
+    participationRate = 1.5
+    barrier = 70.0
+    barrierStartDate = issueDate
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: barrier never touched (only checked at maturity, comfortably above 70.0).
+  --   spot@maturity = 90.0
+  --   tracker   = notional * 90/100                                    = 900.0
+  --   call      = notional * (participationRate - 1) * max(0, 0.9-1)   = 0.0 (below strike)
+  --   bonus put = notional * (1 - 90/100)                              = 100.0
+  --   expected total CHF credited to investor                         = 1000.0 (bonus floor)
+  do
+    factoryCid <-
+      submit issuer do createCmd BonusOutperformance.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid BonusOutperformance.Originate with
+        id = Id "SSPA1330-NOBREACH"; description = "Bonus Outperformance Certificate (no breach)"
+        referenceAssetId; strike; participationRate; barrier; barrierStartDate; maturityDate
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    -- An observation at `barrierStartDate` is required too: see the equivalent comment in
+    -- runBonus for why.
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (maturityDate, 90.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1330-nobreach")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1000.0
+
+  -- Scenario B: barrier touched at breachDate, spot@breachDate = 65.0 (<= barrier 70.0) -> bonus
+  -- put knocked out for the rest of the note's life; no cash is produced by the touch event itself.
+  --   spot@maturity = 130.0 (above strike, participation still applies -- only the bonus floor is
+  --   lost)
+  --   tracker = notional * 130/100                                  = 1300.0
+  --   call    = notional * (participationRate - 1) * max(0, 1.3-1)  = 1000 * 0.5 * 0.3 = 150.0
+  --   expected total CHF credited to investor                       = 1450.0
+  do
+    factoryCid <-
+      submit issuer do createCmd BonusOutperformance.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid BonusOutperformance.Originate with
+        id = Id "SSPA1330-BREACH"; description = "Bonus Outperformance Certificate (breach)"
+        referenceAssetId; strike; participationRate; barrier; barrierStartDate; maturityDate
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (breachDate, 65.0), (maturityDate, 130.0)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0 [obsCid]
+    breachResult <-
+      claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1330-breach-touch")
+    -- No cash should be produced purely by the barrier touch itself.
+    breachResult.cashHoldingCid === None
+    Some noteHoldingCid1 <- pure breachResult.noteHoldingCid
+
+    (_, [maturityEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1 [obsCid]
+    maturityResult <-
+      claimAndSettle infra noteHoldingCid1 maturityEffectCid (Id "settle-1330-breach-maturity")
+    Some maturityCashCid <- pure maturityResult.cashHoldingCid
+    maturityTotal <- sumHoldingAmounts investor [maturityCashCid]
+    maturityTotal === 1450.0
+
+  pure ()
+
+-- | SSPA 1340 -- Twin Win Certificate.
+--
+-- Scenario A: the (lower) barrier is never touched, underlying finishes below the strike -> the
+-- mirrored downside put converts the tracker shortfall into a profit.
+-- Scenario B: the barrier is touched at an interim date -> the mirrored downside put knocks out for
+-- good; the product becomes a plain Tracker Certificate for the remainder of its life.
+runTwinWin : Script ()
+runTwinWin = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA1340-UNDERLYING"
+    strike = 100.0
+    mirrorParticipationRate = 2.0
+    barrier = 70.0
+    barrierStartDate = issueDate
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: barrier never touched (only checked at maturity, comfortably above 70.0).
+  --   spot@maturity = 85.0
+  --   tracker      = notional * 85/100                                          = 850.0
+  --   mirror put   = notional * mirrorParticipationRate * (1 - 85/100)
+  --                = 1000 * 2.0 * 0.15                                          = 300.0
+  --   expected total CHF credited to investor                                   = 1150.0
+  do
+    factoryCid <- submit issuer do createCmd TwinWin.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid TwinWin.Originate with
+        id = Id "SSPA1340-NOBREACH"; description = "Twin Win Certificate (no breach)"
+        referenceAssetId; strike; mirrorParticipationRate; barrier; barrierStartDate; maturityDate
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    -- An observation at `barrierStartDate` is required too: see the equivalent comment in
+    -- runBonus for why.
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (maturityDate, 85.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-1340-nobreach")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1150.0
+
+  -- Scenario B: barrier touched at breachDate, spot@breachDate = 65.0 (<= barrier 70.0) -> mirror
+  -- put knocked out for the rest of the note's life; no cash is produced by the touch event itself.
+  --   spot@maturity = 90.0 -> tracker only = notional * 90/100 = 900.0
+  do
+    factoryCid <- submit issuer do createCmd TwinWin.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid TwinWin.Originate with
+        id = Id "SSPA1340-BREACH"; description = "Twin Win Certificate (breach)"
+        referenceAssetId; strike; mirrorParticipationRate; barrier; barrierStartDate; maturityDate
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (breachDate, 65.0), (maturityDate, 90.0)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0 [obsCid]
+    breachResult <-
+      claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-1340-breach-touch")
+    -- No cash should be produced purely by the barrier touch itself.
+    breachResult.cashHoldingCid === None
+    Some noteHoldingCid1 <- pure breachResult.noteHoldingCid
+
+    (_, [maturityEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1 [obsCid]
+    maturityResult <-
+      claimAndSettle infra noteHoldingCid1 maturityEffectCid (Id "settle-1340-breach-maturity")
+    Some maturityCashCid <- pure maturityResult.cashHoldingCid
+    maturityTotal <- sumHoldingAmounts investor [maturityCashCid]
+    maturityTotal === 900.0
+
+  pure ()

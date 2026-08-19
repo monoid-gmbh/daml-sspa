@@ -1,0 +1,28 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Sspa.Participation.Util where
+
+import ContingentClaims.Core.V3.Claim (Claim, Inequality(..), one, scale, when)
+import ContingentClaims.Core.V3.Observation (Observation(..))
+import Daml.Finance.Claims.V3.Util.Builders (prepareAndTagClaims)
+import Daml.Finance.Interface.Claims.V4.Types (Deliverable, Observable, TaggedClaim)
+import Prelude hiding (and, or, zero)
+
+-- | Type synonym for an `Observation` over a `Date` timeline.
+type O = Observation Date Decimal Observable
+
+-- | Type synonym for a `Claim` over a `Date` timeline.
+type C = Claim Date Decimal Deliverable Observable
+
+-- | Pay `notional * spot / strike` at `valueDate`: a plain, uncapped, unfloored 1:1 tracker on the
+-- underlying, referenced to its initial fixing (`strike`). Used as the base leg of every SSPA 13
+-- (Participation) product.
+createTrackerClaim : (Date -> Time) -> Decimal -> Observable -> Deliverable -> Date -> Decimal ->
+  TaggedClaim
+createTrackerClaim dateToTime strike spot cashInstrument valueDate notional =
+  let
+    claim = when (TimeGte valueDate) $
+      scale (Const (notional / strike) * Observe spot) (one cashInstrument)
+  in
+    prepareAndTagClaims dateToTime [claim] "Tracker payment"

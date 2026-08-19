@@ -1,0 +1,45 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Sspa.Leverage.Util where
+
+import ContingentClaims.Core.V3.Claim (Claim, Inequality(..), one, scale, when)
+import ContingentClaims.Core.V3.Observation (Observation(..))
+import DA.List (last)
+import Daml.Finance.Claims.V3.Util.Builders (prepareAndTagClaims)
+import Daml.Finance.Interface.Claims.V4.Types (Deliverable, Observable, TaggedClaim)
+import Daml.Finance.Interface.Types.Date.V3.Schedule (Schedule)
+import Prelude hiding (and, or, zero)
+
+-- | Type synonym for an `Observation` over a `Date` timeline.
+type O = Observation Date Decimal Observable
+
+-- | Type synonym for a `Claim` over a `Date` timeline.
+type C = Claim Date Decimal Deliverable Observable
+
+-- | Pay `notional * navFactor` at the end of the last period of `schedule`, where `navFactor` is
+-- the compounded product, across every period, of `1 + leverageFactor * periodReturn` (the
+-- period's underlying return, from its adjusted start date to its adjusted end date, magnified by
+-- `leverageFactor`).
+--
+-- This is a "daily-reset" (or, more generally, "periodic-reset") constant leverage structure: each
+-- rebalancing period's leveraged return compounds independently, which is what gives constant
+-- leverage certificates their path dependency and volatility drag versus a simple `leverageFactor`
+-- multiple of the underlying's total return. `leverageFactor` may be negative to model a short
+-- constant leverage certificate.
+--
+-- Used by SSPA 2300 (`Sspa.Leverage.ConstantLeverageCertificate`). This is a simplified model: a
+-- real constant leverage certificate's financing/reset cost is itself a function of prevailing
+-- interest rates, not modeled here.
+createConstantLeverageClaim : (Date -> Time) -> Schedule -> Decimal -> Deliverable -> Observable ->
+  Decimal -> TaggedClaim
+createConstantLeverageClaim dateToTime schedule notional cashInstrument spot leverageFactor =
+  let
+    periodFactor p =
+      Const 1.0 + Const leverageFactor *
+        (ObserveAt spot p.adjustedEndDate / ObserveAt spot p.adjustedStartDate - Const 1.0)
+    navFactor = foldl (\acc p -> acc * periodFactor p) (Const 1.0) schedule
+    lastPeriodEnd = (.adjustedEndDate) $ last schedule
+    claim = when (TimeGte lastPeriodEnd) $ scale (Const notional * navFactor) (one cashInstrument)
+  in
+    prepareAndTagClaims dateToTime [claim] "Constant leverage redemption"

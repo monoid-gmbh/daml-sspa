@@ -1,0 +1,23 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | SSPA 1230 -- Barrier Reverse Convertible.
+--
+-- This maps directly onto daml-finance's own
+-- `Daml.Finance.Instrument.StructuredProduct.V0.BarrierReverseConvertible` package: it is modeled
+-- as a long fixed-coupon bond plus a short down-and-in put, i.e. exactly
+-- `Sspa.YieldEnhancement.ReverseConvertible` (SSPA 1220) with the short put only knocking in once
+-- the underlying touches or breaches a lower barrier. Since daml-finance already ships a
+-- battle-tested implementation of this exact structure, we reuse it as-is here rather than
+-- reimplementing an equivalent instrument from scratch.
+--
+-- See `Sspa.CapitalProtection.Barrier` for an example of building an equivalent barrier-featured
+-- instrument from scratch with the same underlying `Daml.Finance.Claims.V3.Util.Builders`
+-- primitives, for products where daml-finance doesn't ship a ready-made instrument.
+module Sspa.YieldEnhancement.BarrierReverseConvertible
+  ( Instrument(..)
+  , Factory(..)
+  ) where
+
+import Daml.Finance.Instrument.StructuredProduct.V0.BarrierReverseConvertible.Factory (Factory(..))
+import Daml.Finance.Instrument.StructuredProduct.V0.BarrierReverseConvertible.Instrument (Instrument(..))

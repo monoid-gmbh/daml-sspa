@@ -1,0 +1,54 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Sspa.CreditRisk.Util where
+
+import ContingentClaims.Core.V3.Claim (Claim, Inequality(..), until)
+import ContingentClaims.Core.V3.Observation (Observation(..))
+import Daml.Finance.Interface.Claims.V4.Types (Deliverable, Observable, TaggedClaim(..))
+import Daml.Finance.Interface.Types.Date.V3.Calendar (BusinessDayAdjustment(..), BusinessDayConventionEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.RollConvention (Period(..), PeriodEnum(..), RollConventionEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.Schedule (Frequency(..), PeriodicSchedule(..), ScheduleFrequency(..))
+import Prelude hiding (and, or, zero)
+
+-- | Type synonym for an `Observation` over a `Date` timeline.
+type O = Observation Date Decimal Observable
+
+-- | Type synonym for a `Claim` over a `Date` timeline.
+type C = Claim Date Decimal Deliverable Observable
+
+-- | Wrap an already-built `TaggedClaim` (from any
+-- `Daml.Finance.Claims.V3.Util.Builders`/`Sspa.*.Util` builder) so that it is only active as long
+-- as no credit event of the reference entity has occurred, i.e. until the credit event trigger
+-- observable (`defaultProbabilityReferenceId`) first reaches 1.0. `until`'s condition doesn't
+-- depend on the surrounding claim's time representation, so this can post-process any
+-- already-time-converted `TaggedClaim`, regardless of which builder produced it.
+--
+-- Used by every SSPA 14 (Additional credit risk) product: each one is a category 11/12/13 product
+-- whose every claim -- coupon, participation, redemption -- is wrapped with this, plus a
+-- `Daml.Finance.Claims.V3.Util.Builders.createCreditEventPaymentClaims` claim added alongside it to
+-- pay out `(1 - recoveryRate) * notional` if/when the credit event actually occurs.
+untilCreditEvent : Observable -> TaggedClaim -> TaggedClaim
+untilCreditEvent defaultProbabilityReferenceId taggedClaim =
+  taggedClaim with
+    claim = until (Lte (Const 1.0, Observe defaultProbabilityReferenceId)) taggedClaim.claim
+
+-- | A minimal `PeriodicSchedule` spanning `[issueDate, maturityDate]`, for products that need to
+-- pass a `PeriodicSchedule` to
+-- `Daml.Finance.Claims.V3.Util.Builders.createCreditEventPaymentClaims` purely to bound its credit
+-- event observation window (that function only reads `.effectiveDate`/`.terminationDate`), without
+-- having any actual periodic payment schedule of their own.
+creditEventWindow : Date -> Date -> PeriodicSchedule
+creditEventWindow issueDate maturityDate =
+  PeriodicSchedule with
+    businessDayAdjustment = BusinessDayAdjustment with calendarIds = []; convention = Following
+    effectiveDateBusinessDayAdjustment = None
+    terminationDateBusinessDayAdjustment = None
+    frequency = Periodic Frequency with
+      rollConvention = DOM 1
+      period = Period with period = Y; periodMultiplier = 1
+    effectiveDate = issueDate
+    firstRegularPeriodStartDate = None
+    lastRegularPeriodEndDate = None
+    stubPeriodType = None
+    terminationDate = maturityDate

@@ -1,0 +1,18 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | SSPA 2200 -- Warrant with Knock-Out.
+--
+-- A cash-settled, automatically-exercised barrier call or put option that immediately expires
+-- worthless if its knock-out barrier is breached during the product's lifetime: small investment,
+-- leveraged performance relative to the underlying, risk of total loss limited to the initial
+-- investment. This maps directly onto daml-finance's own
+-- `Daml.Finance.Instrument.Option.V0.BarrierEuropeanCash` package, so we reuse it as-is here rather
+-- than reimplementing an equivalent instrument from scratch.
+module Sspa.Leverage.WarrantWithKnockOut
+  ( Instrument(..)
+  , Factory(..)
+  ) where
+
+import Daml.Finance.Instrument.Option.V0.BarrierEuropeanCash.Factory (Factory(..))
+import Daml.Finance.Instrument.Option.V0.BarrierEuropeanCash.Instrument (Instrument(..))

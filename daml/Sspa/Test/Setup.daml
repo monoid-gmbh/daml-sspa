@@ -1,0 +1,368 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Reusable Daml Script scaffolding for the SSPA Capital Protection product tests.
+--
+-- This module deliberately avoids the `exerciseInterfaceByKey` / `Reference`-by-key indirection
+-- used internally by daml-finance wherever possible: since this is a self-contained test suite (not
+-- a multi-party production workflow), concrete `ContractId`s are threaded through the `Script`
+-- directly instead. The one place this can't be avoided is instruments, which the lifecycling and
+-- claiming machinery addresses via `InstrumentKey` (by-key) -- but that's handled internally by each
+-- product's `Factory.Originate` choice (which already calls `BaseInstrument.createReference`), so no
+-- extra work is needed here.
+module Sspa.Test.Setup where
+
+import DA.Date (DayOfWeek(..), toGregorian)
+import DA.Map qualified as Map
+import DA.Set qualified as Set
+import Daml.Finance.Account.V4.Account qualified as AccountImpl (Factory(..))
+import Daml.Finance.Claims.V3.Lifecycle.Rule qualified as LifecycleRuleImpl (Rule(..))
+import Daml.Finance.Data.V4.Numeric.Observation (Observation(..))
+import Daml.Finance.Data.V4.Reference.HolidayCalendar (HolidayCalendar(..))
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Data.V4.Time.DateClockUpdate (DateClockUpdateEvent(..))
+import Daml.Finance.Holding.V4.Factory qualified as HoldingFactoryImpl (Factory(..))
+import Daml.Finance.Instrument.Token.V4.Factory qualified as TokenImpl (Factory(..))
+import Daml.Finance.Interface.Account.V4.Account qualified as Account (Controllers(..))
+import Daml.Finance.Interface.Account.V4.Factory qualified as AccountFactory (Create(..), I)
+import Daml.Finance.Interface.Holding.V4.Factory qualified as HoldingFactory
+  (Create(..), I, createFactory)
+import Daml.Finance.Interface.Holding.V4.Holding qualified as Holding (GetView(..), I)
+import Daml.Finance.Interface.Instrument.Token.V4.Factory qualified as TokenFactory (Create(..), I)
+import Daml.Finance.Interface.Instrument.Token.V4.Types (Token(..))
+import Daml.Finance.Interface.Lifecycle.V4.Effect qualified as Effect (I)
+import Daml.Finance.Interface.Lifecycle.V4.Event qualified as Event (I)
+import Daml.Finance.Interface.Lifecycle.V4.Observable.NumericObservable qualified as NumericObservable
+  (I)
+import Daml.Finance.Interface.Lifecycle.V4.Rule.Claim qualified as Claim (ClaimEffect(..), I)
+import Daml.Finance.Interface.Lifecycle.V4.Rule.Lifecycle qualified as Lifecycle (Evolve(..), I)
+import Daml.Finance.Interface.Settlement.V4.Batch qualified as Batch (Settle(..))
+import Daml.Finance.Interface.Settlement.V4.Factory qualified as SettlementFactory (I)
+import Daml.Finance.Interface.Settlement.V4.Instruction qualified as
+  Instruction (Allocate(..), Approve(..), GetView(..), I)
+import Daml.Finance.Interface.Settlement.V4.RouteProvider qualified as RouteProvider (I)
+import Daml.Finance.Interface.Settlement.V4.Types (Allocation(..), Approval(..))
+import Daml.Finance.Interface.Types.Common.V3.Types
+  ( AccountKey(..), HoldingFactoryKey(..), HoldingStandard(..), Id(..), InstrumentKey(..)
+  , PartiesMap
+  )
+import Daml.Finance.Interface.Types.Date.V3.Calendar
+  (BusinessDayAdjustment(..), BusinessDayConventionEnum, HolidayCalendarData(..))
+import Daml.Finance.Interface.Types.Date.V3.RollConvention
+  (Period(..), PeriodEnum, RollConventionEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.Schedule (Frequency(..), PeriodicSchedule(..), ScheduleFrequency(..))
+import Daml.Finance.Lifecycle.V4.Rule.Claim qualified as ClaimRuleImpl (Rule(..))
+import Daml.Finance.Settlement.V4.Factory qualified as SettlementFactoryImpl (Factory(..))
+import Daml.Finance.Settlement.V4.RouteProvider.SingleCustodian qualified as
+  RouteProviderImpl (SingleCustodian(..))
+import Daml.Script
+
+-- | Bundles the common infrastructure shared by all SSPA Capital Protection test scenarios: parties,
+-- a CHF cash instrument, an account/holding factory, the investor's cash and note accounts, and a
+-- claim rule wired up for full claim -> settle round-tripping.
+data Infra = Infra
+  with
+    issuer : Party
+      -- ^ Plays depository, issuer and custodian for every instrument and account in these tests.
+    investor : Party
+      -- ^ Holds the notes and receives cash payments.
+    calendarDataProvider : Party
+      -- ^ Publishes holiday calendars (used by the Coupon product's periodic schedule).
+    publicParty : Party
+      -- ^ Shared read-only observer.
+    cashInstrument : InstrumentKey
+      -- ^ The CHF cash instrument used to settle all products.
+    holdingFactoryCid : ContractId HoldingFactory.I
+      -- ^ Used to mint (credit) holdings directly, without needing by-key lookups.
+    investorCashAccount : AccountKey
+      -- ^ The investor's CHF cash account (custodian = issuer).
+    investorNoteAccount : AccountKey
+      -- ^ The investor's notes account (custodian = issuer).
+    claimRuleCid : ContractId Claim.I
+      -- ^ Used by the investor to claim `Effect`s and generate settlement instructions.
+  deriving Show
+
+-- | `Daml.Finance.Interface.Holding.V4.Factory.createReference` (which registers a
+-- `HoldingFactory.Reference` for by-key lookup -- required by `Account.Credit`, which resolves the
+-- account's `holdingFactory : HoldingFactoryKey` field by key) is an `Update`-level helper, not
+-- something a Daml Script `submit` block can call directly (that only builds `createCmd`
+-- `/exerciseCmd` ledger commands, it doesn't run arbitrary `Update` actions). This one-off
+-- bootstrap template's choice body runs in `Update`, so it can call it.
+template HoldingFactoryBootstrap
+  with
+    provider : Party
+  where
+    signatory provider
+
+    choice Bootstrap : ContractId HoldingFactory.I
+      with
+        id : Id
+        observers : PartiesMap
+      controller provider
+      do
+        HoldingFactory.createFactory HoldingFactoryImpl.Factory with provider; id; observers
+
+-- | Set up parties, the CHF cash instrument, accounts and the claim rule shared by all scenarios.
+setupInfra : Script Infra
+setupInfra = do
+  [issuer, investor, calendarDataProvider, publicParty] <-
+    mapA (\name -> allocatePartyWithHint name $ PartyIdHint name)
+      ["Issuer", "Investor", "CalendarDataProvider", "PublicParty"]
+
+  now <- getTime
+  let pp = Map.fromList [("PublicParty", Set.singleton publicParty)]
+
+  cashInstrument <- originateCash issuer "CHF" "Swiss Francs" pp now
+
+  accountFactoryCid <- toInterfaceContractId @AccountFactory.I <$> submit issuer do
+    createCmd AccountImpl.Factory with provider = issuer; observers = mempty
+
+  holdingFactoryBootstrapCid <- submit issuer do
+    createCmd HoldingFactoryBootstrap with provider = issuer
+  holdingFactoryCid <- submit issuer do
+    exerciseCmd holdingFactoryBootstrapCid Bootstrap with
+      id = Id "HoldingFactory"; observers = mempty
+  let holdingFactory = HoldingFactoryKey with provider = issuer; id = Id "HoldingFactory"
+
+  investorCashAccount <-
+    createAccount accountFactoryCid holdingFactory pp issuer investor "Cash Account"
+  investorNoteAccount <-
+    createAccount accountFactoryCid holdingFactory pp issuer investor "Notes Account"
+
+  routeProviderCid <- toInterfaceContractId @RouteProvider.I <$> submit issuer do
+    createCmd RouteProviderImpl.SingleCustodian with
+      provider = issuer; observers = mempty; custodian = issuer
+
+  settlementFactoryCid <- toInterfaceContractId @SettlementFactory.I <$> submit issuer do
+    createCmd SettlementFactoryImpl.Factory with provider = issuer; observers = mempty
+
+  claimRuleCid <- toInterfaceContractId @Claim.I <$> submit issuer do
+    createCmd ClaimRuleImpl.Rule with
+      provider = issuer
+      claimers = Set.singleton investor
+      settlers = Set.singleton issuer
+      routeProviderCid
+      settlementFactoryCid
+      netInstructions = True
+
+  pure Infra with
+    issuer; investor; calendarDataProvider; publicParty; cashInstrument; holdingFactoryCid
+    investorCashAccount; investorNoteAccount; claimRuleCid
+
+-- | Originate a CHF `Token` cash instrument (issuer = depository = custodian = the given party).
+originateCash : Party -> Text -> Text -> PartiesMap -> Time -> Script InstrumentKey
+originateCash issuer label description observers timestamp = do
+  tokenFactoryCid <- toInterfaceContractId @TokenFactory.I <$> submit issuer do
+    createCmd TokenImpl.Factory with provider = issuer; observers = mempty
+  let
+    instrumentKey = InstrumentKey with
+      depository = issuer; issuer; id = Id label; version = "0"
+      holdingStandard = TransferableFungible
+    token = Token with instrument = instrumentKey; validAsOf = timestamp; description
+  submitMulti [issuer] [] do
+    exerciseCmd tokenFactoryCid TokenFactory.Create with token; observers
+  pure instrumentKey
+
+-- | Create an `Account` (custodian = issuer, owner = the given party). Controllers are set so that
+-- both the custodian and the owner must jointly authorize inbound/outbound transfers -- this test
+-- suite always submits settlement steps with both the issuer and the investor as `actAs` parties, so
+-- the exact choice of controllers does not otherwise matter here.
+createAccount : ContractId AccountFactory.I -> HoldingFactoryKey -> PartiesMap -> Party -> Party ->
+  Text -> Script AccountKey
+createAccount accountFactoryCid holdingFactory observers custodian owner description = do
+  let
+    account = AccountKey with
+      custodian; owner; id = Id $ show owner <> "@" <> show custodian <> "/" <> description
+    controllers = Account.Controllers with
+      outgoing = Set.singleton owner; incoming = Set.singleton owner
+  submitMulti [custodian, owner] [] do
+    exerciseCmd accountFactoryCid AccountFactory.Create with
+      account; holdingFactory; controllers; observers; description
+  pure account
+
+-- | Mint (credit) a holding directly into an account via the holding factory.
+mintHolding : ContractId HoldingFactory.I -> InstrumentKey -> AccountKey -> Decimal -> PartiesMap ->
+  Script (ContractId Holding.I)
+mintHolding holdingFactoryCid instrument account amount observers =
+  submitMulti [account.custodian, account.owner] [] do
+    exerciseCmd holdingFactoryCid HoldingFactory.Create with instrument; account; amount; observers
+
+-- | Create a numeric price-fixing observable for a reference asset. Only needs entries at the exact
+-- dates that `lifecycleInstrument` is subsequently called with for this instrument -- the lifecycle
+-- engine only consults the observable at the specific event dates it is asked to process, not
+-- continuously, so dense/daily fixings are not required. Since each `Evolve` call replays this
+-- instrument's full event history from inception, the SAME `Observation` contract (with entries for
+-- every date ever used) should be reused across all `lifecycleInstrument` calls for one instrument.
+createObservation : Party -> Text -> [(Date, Decimal)] -> Script (ContractId NumericObservable.I)
+createObservation issuer referenceAssetId fixings =
+  toInterfaceContractId <$> submit issuer do
+    createCmd Observation with
+      provider = issuer
+      id = Id referenceAssetId
+      observations = Map.fromList $ map (\(d, p) -> (dateToDateClockTime d, p)) fixings
+      observers = mempty
+
+-- | Publish a trivial holiday calendar (no holidays, weekends = Sat/Sun) visible to the given
+-- observers. Needed for the Coupon product, which looks up holiday calendars by (provider, id) when
+-- rolling out its periodic schedule.
+createHolidayCalendar : Party -> Text -> [Party] -> Script ()
+createHolidayCalendar calendarDataProvider calendarId observers = do
+  submit calendarDataProvider do
+    createCmd HolidayCalendar with
+      provider = calendarDataProvider
+      calendar = HolidayCalendarData with id = calendarId; weekend = [Saturday, Sunday]; holidays = []
+      observers = Map.fromList [("Observers", Set.fromList observers)]
+  pure ()
+
+-- | Create a schedule for periodic coupon payments. Mirrors daml-finance's own
+-- `Daml.Finance.Test.Util.Time.createPaymentPeriodicSchedule` test helper.
+createPaymentPeriodicSchedule : Date -> [Text] -> BusinessDayConventionEnum -> PeriodEnum -> Int ->
+  Date -> Date -> PeriodicSchedule
+createPaymentPeriodicSchedule firstCouponDate holidayCalendarIds businessDayConvention couponPeriod
+  couponPeriodMultiplier issueDate maturityDate =
+    let
+      (_, _, d) = toGregorian firstCouponDate
+    in
+      PeriodicSchedule with
+        businessDayAdjustment = BusinessDayAdjustment with
+          calendarIds = holidayCalendarIds; convention = businessDayConvention
+        effectiveDateBusinessDayAdjustment = None
+        terminationDateBusinessDayAdjustment = None
+        frequency = Periodic Frequency with
+          rollConvention = DOM d
+          period = Period with period = couponPeriod; periodMultiplier = couponPeriodMultiplier
+        effectiveDate = issueDate
+        firstRegularPeriodStartDate = Some firstCouponDate
+        lastRegularPeriodEndDate = Some maturityDate
+        stubPeriodType = None
+        terminationDate = maturityDate
+
+-- | Lifecycle an instrument as of the given date: creates a fresh clock-update `Event` and a fresh
+-- `Lifecycle.Rule`, then exercises `Evolve`. Returns the new instrument version (if the claim state
+-- changed) and any `Effect`s produced on this date. Must be called strictly in date order, threading
+-- the returned `InstrumentKey` forward into the next call's `instrument` argument -- each `Evolve`
+-- call replays the full event history recorded on the instrument version it is given, so skipping a
+-- date or reusing a stale key will make later claims fail (the produced `Effect`'s `targetInstrument`
+-- must exactly match what the investor currently holds).
+lifecycleInstrument : Party -> [Party] -> Date -> InstrumentKey -> [ContractId NumericObservable.I] ->
+  Script (Optional InstrumentKey, [ContractId Effect.I])
+lifecycleInstrument issuer readAs today instrument observableCids = do
+  clockEventCid <- toInterfaceContractId @Event.I <$> submit issuer do
+    createCmd DateClockUpdateEvent with
+      providers = Set.singleton issuer
+      date = today
+      eventTime = dateToDateClockTime today
+      id = Id (show today)
+      description = show today
+      observers = mempty
+
+  lifecycleRuleCid <- toInterfaceContractId @Lifecycle.I <$> submit issuer do
+    createCmd LifecycleRuleImpl.Rule with
+      providers = Set.singleton issuer
+      observers = mempty
+      lifecycler = issuer
+      id = Id "LifecycleRule"
+      description = "Rule to lifecycle an SSPA instrument"
+
+  submitMulti [issuer] readAs do
+    exerciseCmd lifecycleRuleCid Lifecycle.Evolve with
+      eventCid = clockEventCid; observableCids; instrument
+
+-- | Result of claiming and fully settling one `Effect` against the investor's current note holding.
+data ClaimSettleResult = ClaimSettleResult
+  with
+    cashHoldingCid : Optional (ContractId Holding.I)
+      -- ^ The investor's newly-credited CHF holding for this effect, if any cash was produced.
+    noteHoldingCid : Optional (ContractId Holding.I)
+      -- ^ The investor's newly-credited note holding (new instrument version), if the note survives
+      --   this event. `None` means the note was fully redeemed (no more claims remain).
+  deriving Show
+
+-- | Claim an `Effect` against the investor's current note holding, and settle it all the way
+-- through: allocate + approve every generated settlement `Instruction` (generically, based on
+-- whether each instruction's sender or receiver is the custodian, since this test suite uses a
+-- single-custodian design where the issuer is custodian of every account), then settle the batch.
+--
+-- Every claim always includes (at least) a "consumed" leg for the note holding being claimed
+-- (`Pledge` the held note / `DebitSender`, since the investor is both the sender and, apart from the
+-- issuer, the only party the routed step touches) and, if the instrument still has claims remaining
+-- after this event, a "produced" leg crediting the investor with the new note version
+-- (`CreditReceiver` / `TakeDelivery`, since the issuer -- as custodian -- can mint it directly). Any
+-- cash payoff is a further `CreditReceiver` / `TakeDelivery` leg. Since the issuer is custodian of
+-- every account in this design, no leg ever needs an actual pre-funded holding to pledge on the
+-- "mint" side.
+claimAndSettle : Infra -> ContractId Holding.I -> ContractId Effect.I -> Id -> Script ClaimSettleResult
+claimAndSettle infra noteHoldingCid effectCid batchId = do
+  let Infra{issuer; investor; claimRuleCid; cashInstrument; investorCashAccount; investorNoteAccount} =
+        infra
+
+  -- `ClaimEffect`'s own top-level controller is `claimer` (the investor) alone, but its body
+  -- internally exercises `RouteProvider.Discover` and `SettlementFactory.Instruct`, both controlled
+  -- by the claim rule's `provider` (the issuer) -- so the issuer's authority must also be part of
+  -- this submission's `actAs`, not merely its `readAs`, or those nested exercises are unauthorized.
+  result <- submitMulti [issuer, investor] [] do
+    exerciseCmd claimRuleCid Claim.ClaimEffect with
+      claimer = investor; holdingCids = [noteHoldingCid]; effectCid; batchId
+
+  _ <- mapA
+    (allocateAndApproveInstruction issuer investor investorCashAccount investorNoteAccount
+      cashInstrument noteHoldingCid)
+    result.instructionCids
+
+  settledCids <- submitMulti [issuer, investor] [] do
+    exerciseCmd result.batchCid Batch.Settle with actors = Set.fromList [issuer, investor]
+
+  views <- mapA
+    (\cid -> submit investor do exerciseCmd cid Holding.GetView with viewer = investor)
+    settledCids
+  let
+    paired = zip settledCids views
+    cashHoldingCid = fst <$> findFirst (\(_, v) -> v.instrument.id == cashInstrument.id) paired
+    newNoteHoldingCid = fst <$> findFirst (\(_, v) -> v.instrument.id /= cashInstrument.id) paired
+
+  pure ClaimSettleResult with cashHoldingCid; noteHoldingCid = newNoteHoldingCid
+
+-- | Allocate and approve a single settlement `Instruction`, in a way generic to any instruction that
+-- `claimAndSettle`'s `ClaimEffect` call can produce in this single-custodian test design: if the
+-- routed step's receiver is the custodian, the (investor-held) note is pledged and the custodian
+-- debits it; otherwise the sender is the custodian, which mints the quantity directly to the
+-- receiver's account.
+allocateAndApproveInstruction : Party -> Party -> AccountKey -> AccountKey -> InstrumentKey ->
+  ContractId Holding.I -> ContractId Instruction.I -> Script ()
+allocateAndApproveInstruction issuer investor investorCashAccount investorNoteAccount cashInstrument
+  noteHoldingCid instrCid = do
+    v <- submit issuer do exerciseCmd instrCid Instruction.GetView with viewer = issuer
+    let
+      step = v.routedStep
+      both = Set.fromList [issuer, investor]
+    if step.receiver == step.custodian
+      then do
+        (instrCid', _) <- submitMulti [issuer, investor] [] do
+          exerciseCmd instrCid Instruction.Allocate with
+            actors = both; allocation = Pledge noteHoldingCid
+        _ <- submitMulti [issuer, investor] [] do
+          exerciseCmd instrCid' Instruction.Approve with actors = both; approval = DebitSender
+        pure ()
+      else do
+        let
+          receiverAccount =
+            if step.quantity.unit.id == cashInstrument.id
+              then investorCashAccount
+              else investorNoteAccount
+        (instrCid', _) <- submitMulti [issuer, investor] [] do
+          exerciseCmd instrCid Instruction.Allocate with actors = both; allocation = CreditReceiver
+        _ <- submitMulti [issuer, investor] [] do
+          exerciseCmd instrCid' Instruction.Approve with
+            actors = both; approval = TakeDelivery receiverAccount
+        pure ()
+
+-- | Sum the `amount`s of a list of (fungible) holdings, as viewed by their owner.
+sumHoldingAmounts : Party -> [ContractId Holding.I] -> Script Decimal
+sumHoldingAmounts owner cids = do
+  views <- mapA (\cid -> submit owner do exerciseCmd cid Holding.GetView with viewer = owner) cids
+  pure $ foldl (\acc v -> acc + v.amount) 0.0 views
+
+-- | Find the first element of a list satisfying a predicate.
+findFirst : (a -> Bool) -> [a] -> Optional a
+findFirst _ [] = None
+findFirst p (x :: xs) = if p x then Some x else findFirst p xs

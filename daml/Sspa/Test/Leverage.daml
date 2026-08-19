@@ -1,0 +1,483 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | End-to-end Daml Script scenarios for the five SSPA Leverage products. Each scenario originates
+-- a note (or, for the two products that reuse daml-finance's own option instruments, an option
+-- position), mints it into the investor's holding, lifecycles the underlying claim tree forward
+-- through one or more market events (feeding it price fixings via an `Observation` contract), and
+-- then claims + fully settles every `Effect` produced -- asserting the investor's actual CHF
+-- holding balance at each step. Expected amounts are computed by hand in the comments so that each
+-- assertion is self-documenting.
+module Sspa.Test.Leverage where
+
+import DA.Assert ((===))
+import DA.Date (Month(..), date)
+import DA.Map qualified as Map
+import DA.Set qualified as Set
+import Daml.Finance.Data.V4.Time.DateClock (dateToDateClockTime)
+import Daml.Finance.Interface.Instrument.Option.V0.BarrierEuropeanCash.Factory qualified as
+  BarrierEuropeanCashFactory (Create(..), I)
+import Daml.Finance.Interface.Instrument.Option.V0.BarrierEuropeanCash.Types (BarrierEuropean(..))
+import Daml.Finance.Interface.Instrument.Option.V0.EuropeanCash.Factory qualified as
+  EuropeanCashFactory (Create(..), I)
+import Daml.Finance.Interface.Instrument.Option.V0.EuropeanCash.Types (European(..))
+import Daml.Finance.Interface.Instrument.Option.V0.Types (BarrierTypeEnum(..), OptionTypeEnum(..))
+import Daml.Finance.Interface.Types.Common.V3.Types (HoldingStandard(..), Id(..), InstrumentKey(..))
+import Daml.Finance.Interface.Types.Date.V3.Calendar (BusinessDayConventionEnum(..))
+import Daml.Finance.Interface.Types.Date.V3.RollConvention (PeriodEnum(..))
+import Daml.Script
+import Sspa.Leverage.ConstantLeverageCertificate qualified as ConstantLeverageCertificate
+import Sspa.Leverage.MiniFuture qualified as MiniFuture
+import Sspa.Leverage.SpreadWarrant qualified as SpreadWarrant
+import Sspa.Leverage.Warrant qualified as Warrant
+import Sspa.Leverage.WarrantWithKnockOut qualified as WarrantWithKnockOut
+import Sspa.Test.Setup
+
+-- | SSPA 2110 -- Spread Warrant (Bull call spread: long call at `longStrike` + short call at
+-- `shortStrike`).
+--
+-- Scenario A: the underlying finishes strictly between the two strikes -> partial (uncapped-so-far)
+-- participation.
+-- Scenario B: the underlying finishes above the short strike -> participation is capped at the
+-- spread width.
+runSpreadWarrant : Script ()
+runSpreadWarrant = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    referenceAssetId = "SSPA2110-UNDERLYING"
+    isCall = True
+    longStrike = 100.0
+    shortStrike = 120.0
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: spot@maturity = 110.0 (between the two strikes).
+  --   long leg  = notional * max(0, 110 - 100) / 100 = 1000 * 0.10          =  100.0
+  --   short leg = notional * max(0, 110 - 120) / 100 = 1000 * 0             =    0.0
+  --   expected total CHF credited to investor                              =  100.0
+  do
+    factoryCid <- submit issuer do createCmd SpreadWarrant.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid SpreadWarrant.Originate with
+        id = Id "SSPA2110-PARTIAL"; description = "Spread Warrant (partial participation)"
+        referenceAssetId; isCall; longStrike; shortStrike; maturityDate; currency = cashInstrument
+        notional; observers; holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 110.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-2110-partial")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 100.0
+
+  -- Scenario B: spot@maturity = 140.0 (above the short strike) -> participation caps at the spread
+  -- width.
+  --   long leg  = notional * max(0, 140 - 100) / 100 = 1000 * 0.40          =  400.0
+  --   short leg = notional * max(0, 140 - 120) / 100 = 1000 * 0.20          =  200.0
+  --   expected total CHF credited to investor (long - short)                =  200.0
+  do
+    factoryCid <- submit issuer do createCmd SpreadWarrant.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid SpreadWarrant.Originate with
+        id = Id "SSPA2110-CAPPED"; description = "Spread Warrant (capped participation)"
+        referenceAssetId; isCall; longStrike; shortStrike; maturityDate; currency = cashInstrument
+        notional; observers; holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 140.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-2110-capped")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 200.0
+
+  pure ()
+
+-- | SSPA 2210 -- Mini-Future (Long).
+--
+-- Scenario A: the stop-loss level is never touched -> intrinsic value paid in full at maturity.
+-- Scenario B: the stop-loss level is touched at an interim date -> the main payoff is knocked out
+-- (nets to zero at maturity) and a fixed residual is paid instead, at the moment of breach.
+runMiniFuture : Script ()
+runMiniFuture = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    referenceAssetId = "SSPA2210-UNDERLYING"
+    isLong = True
+    financingLevel = 80.0
+    stopLossLevel = 90.0 -- above financingLevel, per the Long convention
+    stopLossStartDate = issueDate
+    stopLossResidualRate = 0.05
+    notional = 1000.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: stop-loss never touched (spot stays comfortably above 90.0 throughout).
+  --   spot@maturity = 110.0
+  --   payoff = notional * max(0, 110 - 80) / 80 = 1000 * 30 / 80 = 375.0
+  do
+    factoryCid <- submit issuer do createCmd MiniFuture.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid MiniFuture.Originate with
+        id = Id "SSPA2210-NOBREACH"; description = "Mini-Future (no stop-loss breach)"
+        referenceAssetId; isLong; financingLevel; stopLossLevel; stopLossStartDate
+        stopLossResidualRate; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    -- An observation at `stopLossStartDate` is required too: see the `barrierStartDate` gotcha
+    -- documented in `Sspa.Test.CapitalProtection.runBarrier`.
+    obsCid <- createObservation issuer referenceAssetId
+      [(stopLossStartDate, 100.0), (maturityDate, 110.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-2210-nobreach")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 375.0
+
+  -- Scenario B: stop-loss touched at breachDate, spot@breachDate = 85.0 (<= stopLossLevel 90.0).
+  --   residual = notional * stopLossResidualRate = 1000 * 0.05 = 50.0, paid at the moment of breach
+  --   the main (intrinsic value) leg nets to zero at maturity once knocked out
+  do
+    factoryCid <- submit issuer do createCmd MiniFuture.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid MiniFuture.Originate with
+        id = Id "SSPA2210-BREACH"; description = "Mini-Future (stop-loss breach)"
+        referenceAssetId; isLong; financingLevel; stopLossLevel; stopLossStartDate
+        stopLossResidualRate; maturityDate; currency = cashInstrument; notional; observers
+        holdingStandard = TransferableFungible; lastEventTimestamp
+    noteHoldingCid0 <- mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(stopLossStartDate, 100.0), (breachDate, 85.0), (maturityDate, 95.0)]
+
+    (Some noteInstrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate noteInstrument0 [obsCid]
+    breachResult <-
+      claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-2210-breach-residual")
+    Some residualCashCid <- pure breachResult.cashHoldingCid
+    residualTotal <- sumHoldingAmounts investor [residualCashCid]
+    residualTotal === 50.0
+    Some noteHoldingCid1 <- pure breachResult.noteHoldingCid
+
+    (_, [maturityEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate noteInstrument1 [obsCid]
+    maturityResult <-
+      claimAndSettle infra noteHoldingCid1 maturityEffectCid (Id "settle-2210-breach-maturity")
+    -- The main leg has netted to zero: either no cash effect is produced at all, or one is
+    -- produced with a zero amount -- accept either.
+    case maturityResult.cashHoldingCid of
+      None -> pure ()
+      Some cashCid -> do
+        total <- sumHoldingAmounts investor [cashCid]
+        total === 0.0
+
+  pure ()
+
+-- | SSPA 2300 -- Constant Leverage Certificate.
+--
+-- Scenario A: a Long 3x certificate over a 2-period quarterly rebalancing schedule, with one
+-- positive-performance period followed by one negative-performance period -- demonstrating
+-- period-over-period compounding (not a simple multiple of the underlying's total return).
+-- Scenario B: a Short 2x certificate over a single period, for a simpler sanity check.
+runConstantLeverageCertificate : Script ()
+runConstantLeverageCertificate = script do
+  infra@Infra{issuer; investor; calendarDataProvider; publicParty; cashInstrument; holdingFactoryCid;
+    investorNoteAccount} <- setupInfra
+  let
+    holidayCalendarIds = ["CHF"]
+    notional = 1000.0
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  createHolidayCalendar calendarDataProvider "CHF" [issuer, investor, publicParty]
+
+  -- Scenario A: Long 3x, 2 quarterly periods.
+  --   Period 1 [Jan1, Apr1]: 100 -> 110, return = +10%, leveraged = 1 + 3*0.10 = 1.30
+  --   Period 2 [Apr1, Jul1]: 110 -> 104.5, return = -5%, leveraged = 1 + 3*(-0.05) = 0.85
+  --   navFactor = 1.30 * 0.85 = 1.105
+  --   expected total CHF credited to investor = notional * navFactor = 1000 * 1.105 = 1105.0
+  do
+    let
+      issueDateA = date 2026 Jan 1
+      period1End = date 2026 Apr 1
+      period2End = date 2026 Jul 1 -- = maturityDate
+      maturityDateA = period2End
+      referenceAssetIdA = "SSPA2300-LONG-UNDERLYING"
+      leverageFactorA = 3.0
+      lastEventTimestampA = dateToDateClockTime issueDateA
+      rebalancingScheduleA =
+        createPaymentPeriodicSchedule period1End holidayCalendarIds NoAdjustment M 3 issueDateA
+          maturityDateA
+
+    factoryCid <- submit issuer do
+      createCmd ConstantLeverageCertificate.Factory with depository = issuer; issuer
+    noteInstrument0 <- submit issuer do
+      exerciseCmd factoryCid ConstantLeverageCertificate.Originate with
+        id = Id "SSPA2300-LONG"; description = "Constant Leverage Certificate (Long 3x)"
+        referenceAssetId = referenceAssetIdA; leverageFactor = leverageFactorA
+        rebalancingSchedule = rebalancingScheduleA; holidayCalendarIds; calendarDataProvider
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp = lastEventTimestampA
+    noteHoldingCid0 <-
+      mintHolding holdingFactoryCid noteInstrument0 investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetIdA
+      [(issueDateA, 100.0), (period1End, 110.0), (period2End, 104.5)]
+
+    -- The whole certificate is a single claim node gated on `TimeGte lastPeriodEnd` (the
+    -- per-period leveraged returns are folded into one `navFactor` via `ObserveAt` lookups at each
+    -- period boundary), so there's no interim claim state change to lifecycle through at
+    -- `period1End` -- a single call at the termination date suffices.
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] period2End noteInstrument0 [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid0 effectCid (Id "settle-2300-long")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1105.0
+
+  -- Scenario B: Short 2x, single quarterly period.
+  --   Period 1 [Jan1, Apr1]: 100 -> 90, return = -10%, leveraged = 1 + (-2)*(-0.10) = 1.20
+  --   expected total CHF credited to investor = notional * navFactor = 1000 * 1.20 = 1200.0
+  do
+    let
+      issueDateB = date 2026 Jan 1
+      maturityDateB = date 2026 Apr 1
+      referenceAssetIdB = "SSPA2300-SHORT-UNDERLYING"
+      leverageFactorB = -2.0
+      lastEventTimestampB = dateToDateClockTime issueDateB
+      rebalancingScheduleB =
+        createPaymentPeriodicSchedule maturityDateB holidayCalendarIds NoAdjustment M 3 issueDateB
+          maturityDateB
+
+    factoryCid <- submit issuer do
+      createCmd ConstantLeverageCertificate.Factory with depository = issuer; issuer
+    noteInstrument <- submit issuer do
+      exerciseCmd factoryCid ConstantLeverageCertificate.Originate with
+        id = Id "SSPA2300-SHORT"; description = "Constant Leverage Certificate (Short 2x)"
+        referenceAssetId = referenceAssetIdB; leverageFactor = leverageFactorB
+        rebalancingSchedule = rebalancingScheduleB; holidayCalendarIds; calendarDataProvider
+        currency = cashInstrument; notional; observers; holdingStandard = TransferableFungible
+        lastEventTimestamp = lastEventTimestampB
+    noteHoldingCid <- mintHolding holdingFactoryCid noteInstrument investorNoteAccount 1.0 observers
+
+    obsCid <- createObservation issuer referenceAssetIdB
+      [(issueDateB, 100.0), (maturityDateB, 90.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDateB noteInstrument [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-2300-short")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 1200.0
+
+  pure ()
+
+-- | SSPA 2100 -- Warrant (reusing daml-finance's own `EuropeanCash` option instrument).
+--
+-- Unlike the from-scratch SSPA products, this instrument has no `notional` field of its own: the
+-- payoff per unit held is just the option's intrinsic value at expiry (`max(0, +-(spot - strike))`,
+-- not normalized by the strike), so the investor's total cash payoff scales with the quantity of
+-- option units minted into their holding.
+--
+-- Scenario A: a long call, in the money at expiry.
+-- Scenario B: a long put, in the money at expiry.
+runWarrant : Script ()
+runWarrant = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    strike = 100.0
+    units = 10.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: long call, spot@expiry = 130.0.
+  --   payoff per unit = max(0, 130 - 100) = 30.0
+  --   expected total CHF credited to investor = units * 30.0 = 10 * 30.0 = 300.0
+  do
+    let
+      referenceAssetId = "SSPA2100-CALL-UNDERLYING"
+      instrumentKey = InstrumentKey with
+        depository = issuer; issuer; id = Id "SSPA2100-CALL"; version = "0"
+        holdingStandard = TransferableFungible
+
+    factoryCid <- toInterfaceContractId @EuropeanCashFactory.I <$> submit issuer do
+      createCmd Warrant.Factory with provider = issuer; observers = mempty
+    _ <- submit issuer do
+      exerciseCmd factoryCid EuropeanCashFactory.Create with
+        european = European with
+          instrument = instrumentKey; description = "Warrant (call, ITM)"; referenceAssetId
+          ownerReceives = True; optionType = Call; strike; expiryDate = maturityDate
+          currency = cashInstrument; lastEventTimestamp
+        observers
+    noteHoldingCid <-
+      mintHolding holdingFactoryCid instrumentKey investorNoteAccount units observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 130.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate instrumentKey [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-2100-call")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 300.0
+
+  -- Scenario B: long put, spot@expiry = 70.0.
+  --   payoff per unit = max(0, 100 - 70) = 30.0
+  --   expected total CHF credited to investor = units * 30.0 = 10 * 30.0 = 300.0
+  do
+    let
+      referenceAssetId = "SSPA2100-PUT-UNDERLYING"
+      instrumentKey = InstrumentKey with
+        depository = issuer; issuer; id = Id "SSPA2100-PUT"; version = "0"
+        holdingStandard = TransferableFungible
+
+    factoryCid <- toInterfaceContractId @EuropeanCashFactory.I <$> submit issuer do
+      createCmd Warrant.Factory with provider = issuer; observers = mempty
+    _ <- submit issuer do
+      exerciseCmd factoryCid EuropeanCashFactory.Create with
+        european = European with
+          instrument = instrumentKey; description = "Warrant (put, ITM)"; referenceAssetId
+          ownerReceives = True; optionType = Put; strike; expiryDate = maturityDate
+          currency = cashInstrument; lastEventTimestamp
+        observers
+    noteHoldingCid <-
+      mintHolding holdingFactoryCid instrumentKey investorNoteAccount units observers
+
+    obsCid <- createObservation issuer referenceAssetId [(maturityDate, 70.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate instrumentKey [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-2100-put")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 300.0
+
+  pure ()
+
+-- | SSPA 2200 -- Warrant with Knock-Out (reusing daml-finance's own `BarrierEuropeanCash` option
+-- instrument). Like `Sspa.Test.Leverage.runWarrant`, the payoff per unit isn't normalized by a
+-- notional field, so the investor's total cash payoff scales with the quantity of option units
+-- held.
+--
+-- Scenario A: an up-and-out long call, the barrier is never touched -> full intrinsic value paid.
+-- Scenario B: the barrier is touched at an interim date -> the option is knocked out (nets to zero
+-- at expiry, no cash produced at all).
+runWarrantWithKnockOut : Script ()
+runWarrantWithKnockOut = script do
+  infra@Infra{issuer; investor; publicParty; cashInstrument; holdingFactoryCid; investorNoteAccount}
+    <- setupInfra
+  let
+    issueDate = date 2026 Jan 1
+    maturityDate = date 2026 Apr 1
+    breachDate = date 2026 Feb 15
+    strike = 100.0
+    barrier = 150.0
+    barrierStartDate = issueDate
+    units = 10.0
+    lastEventTimestamp = dateToDateClockTime issueDate
+    observers =
+      Map.fromList [("Investor", Set.singleton investor), ("PublicParty", Set.singleton publicParty)]
+
+  -- Scenario A: barrier never touched (spot stays comfortably below 150.0 throughout).
+  --   spot@expiry = 130.0
+  --   payoff per unit = max(0, 130 - 100) = 30.0
+  --   expected total CHF credited to investor = units * 30.0 = 10 * 30.0 = 300.0
+  do
+    let
+      referenceAssetId = "SSPA2200-NOBREACH-UNDERLYING"
+      instrumentKey = InstrumentKey with
+        depository = issuer; issuer; id = Id "SSPA2200-NOBREACH"; version = "0"
+        holdingStandard = TransferableFungible
+
+    factoryCid <- toInterfaceContractId @BarrierEuropeanCashFactory.I <$> submit issuer do
+      createCmd WarrantWithKnockOut.Factory with provider = issuer; observers = mempty
+    _ <- submit issuer do
+      exerciseCmd factoryCid BarrierEuropeanCashFactory.Create with
+        barrierEuropean = BarrierEuropean with
+          instrument = instrumentKey; description = "Warrant with Knock-Out (no breach)"
+          referenceAssetId; ownerReceives = True; optionType = Call; strike; barrier
+          barrierType = UpAndOut; barrierStartDate; expiryDate = maturityDate
+          currency = cashInstrument; lastEventTimestamp
+        observers
+    noteHoldingCid <-
+      mintHolding holdingFactoryCid instrumentKey investorNoteAccount units observers
+
+    -- An observation at `barrierStartDate` is required too: see the `barrierStartDate` gotcha
+    -- documented in `Sspa.Test.CapitalProtection.runBarrier`.
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (maturityDate, 130.0)]
+    (_, [effectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate instrumentKey [obsCid]
+
+    result <- claimAndSettle infra noteHoldingCid effectCid (Id "settle-2200-nobreach")
+    Some cashCid <- pure result.cashHoldingCid
+    total <- sumHoldingAmounts investor [cashCid]
+    total === 300.0
+
+  -- Scenario B: barrier touched at breachDate, spot@breachDate = 155.0 (>= barrier 150.0) -> the
+  -- option is knocked out. No cash is produced at breach (the offsetting "give" is only paid,
+  -- alongside the option's own payoff, at expiry -- both net to zero there).
+  do
+    let
+      referenceAssetId = "SSPA2200-BREACH-UNDERLYING"
+      instrumentKey = InstrumentKey with
+        depository = issuer; issuer; id = Id "SSPA2200-BREACH"; version = "0"
+        holdingStandard = TransferableFungible
+
+    factoryCid <- toInterfaceContractId @BarrierEuropeanCashFactory.I <$> submit issuer do
+      createCmd WarrantWithKnockOut.Factory with provider = issuer; observers = mempty
+    _ <- submit issuer do
+      exerciseCmd factoryCid BarrierEuropeanCashFactory.Create with
+        barrierEuropean = BarrierEuropean with
+          instrument = instrumentKey; description = "Warrant with Knock-Out (breach)"
+          referenceAssetId; ownerReceives = True; optionType = Call; strike; barrier
+          barrierType = UpAndOut; barrierStartDate; expiryDate = maturityDate
+          currency = cashInstrument; lastEventTimestamp
+        observers
+    noteHoldingCid0 <-
+      mintHolding holdingFactoryCid instrumentKey investorNoteAccount units observers
+
+    obsCid <- createObservation issuer referenceAssetId
+      [(barrierStartDate, 100.0), (breachDate, 155.0), (maturityDate, 120.0)]
+
+    (Some instrument1, [breachEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] breachDate instrumentKey [obsCid]
+    breachResult <-
+      claimAndSettle infra noteHoldingCid0 breachEffectCid (Id "settle-2200-breach-touch")
+    breachResult.cashHoldingCid === None
+    Some noteHoldingCid1 <- pure breachResult.noteHoldingCid
+
+    (_, [maturityEffectCid]) <-
+      lifecycleInstrument issuer [publicParty] maturityDate instrument1 [obsCid]
+    maturityResult <-
+      claimAndSettle infra noteHoldingCid1 maturityEffectCid (Id "settle-2200-breach-maturity")
+    case maturityResult.cashHoldingCid of
+      None -> pure ()
+      Some cashCid -> do
+        total <- sumHoldingAmounts investor [cashCid]
+        total === 0.0
+
+  pure ()

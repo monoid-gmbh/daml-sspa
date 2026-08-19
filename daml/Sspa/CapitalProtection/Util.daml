@@ -1,0 +1,58 @@
+-- Copyright (c) 2026 SSPA Daml Finance sample project.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Sspa.CapitalProtection.Util where
+
+import ContingentClaims.Core.V3.Claim
+  (Claim, Inequality(..), andList, at, cond, one, scale, upTo, when, zero)
+import ContingentClaims.Core.V3.Observation (Observation(..))
+import Daml.Finance.Claims.V3.Util.Builders (prepareAndTagClaims)
+import Daml.Finance.Interface.Claims.V4.Types (Deliverable, Observable, TaggedClaim)
+import Daml.Finance.Interface.Types.Date.V3.Schedule (Schedule)
+import Prelude hiding (and, or, zero)
+
+-- | Type synonym for an `Observation` over a `Date` timeline.
+type O = Observation Date Decimal Observable
+
+-- | Type synonym for a `Claim` over a `Date` timeline.
+type C = Claim Date Decimal Deliverable Observable
+
+-- | Pay a fixed cash rebate the first time a barrier condition is observed to hold within the
+-- [barrierStartDate, expiryDate] window.
+--
+-- This is used by barrier-featured capital protection notes (SSPA 1130, 1135): breaching the
+-- barrier forfeits further upside/downside participation, but compensates the holder with a fixed
+-- cash rebate instead. The rebate is expressed as `rebateRate` of the nominal.
+createRebateOnBreachClaim : (Date -> Time) -> Bool -> Decimal -> Observable -> Deliverable -> Date
+  -> Date -> Decimal -> Decimal -> TaggedClaim
+createRebateOnBreachClaim dateToTime isDown barrier spot cashInstrument barrierStartDate expiryDate
+  rebateRate notional =
+  let
+    barrierEvent = if isDown then Lte (Observe spot, Const barrier)
+                             else Lte (Const barrier, Observe spot)
+    payoff = scale (Const (rebateRate * notional)) (one cashInstrument)
+    claim = when (at barrierStartDate) $ when barrierEvent $ when (upTo expiryDate) payoff
+  in
+    prepareAndTagClaims dateToTime [claim] "Barrier rebate payment"
+
+-- | Calculate a coupon for each schedule period based on the underlying's performance over that
+-- period (from the period's adjusted start date to its adjusted end date), floored at zero so the
+-- coupon is never negative.
+--
+-- This is used by SSPA 1140 (Capital Protection Note with Coupon), where "the coupon amount is
+-- dependent on the performance of the underlying".
+createFlooredPerformanceCouponClaims : (Date -> Time) -> Schedule -> Decimal -> Deliverable ->
+  Observable -> Decimal -> TaggedClaim
+createFlooredPerformanceCouponClaims dateToTime schedule notional cashInstrument spot
+  couponParticipation =
+  let
+    couponForPeriod p =
+      let
+        perf = ObserveAt spot p.adjustedEndDate / ObserveAt spot p.adjustedStartDate - Const 1.0
+        couponClaim = scale (Const couponParticipation * Const notional * perf) (one cashInstrument)
+        flooredCouponClaim = cond (Lte (perf, Const 0.0)) zero couponClaim
+      in
+        when (TimeGte p.adjustedEndDate) flooredCouponClaim
+    claims = andList $ map couponForPeriod schedule
+  in
+    prepareAndTagClaims dateToTime [claims] "Performance-linked coupon"
